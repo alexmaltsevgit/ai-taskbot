@@ -1,0 +1,11 @@
+.env
+config.json
+secrets/
+data/
+.codex/
+auth.json
+*.pem
+*.sqlite*
+__pycache__/
+*.py[cod]
+.venv/
