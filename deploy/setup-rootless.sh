@@ -4,6 +4,12 @@
 set -euo pipefail
 export LC_ALL=C
 
+# Kept as a small probe so tests can simulate both permissions without touching
+# the real host socket. Production has no environment bypass for this boundary.
+rootful_socket_writable() {
+  [[ -w /var/run/docker.sock ]]
+}
+
 rootless_setup() {
   local uid username runtime tool unit_state unit_command context_endpoint contexts info
   uid=$(id -u)
@@ -28,7 +34,10 @@ rootless_setup() {
   dpkg-query -S "$tool" 2>/dev/null | grep -q '^docker-ce-rootless-extras: ' || { echo 'Setup tool is not owned by the expected installed Docker package'; return 1; }
   # Rootful Docker may be running for other services. We neither connect to it nor
   # stop it. An account with access to its socket is overprivileged for this setup.
-  [[ ! -w /var/run/docker.sock ]] || { echo 'Account has rootful Docker socket access; remove that access before proceeding'; return 1; }
+  if rootful_socket_writable; then
+    echo 'Account has rootful Docker socket access; remove that access before proceeding'
+    return 1
+  fi
   for dependency in /etc/subuid /etc/subgid; do
     awk -F: -v name="$username" -v uid="$uid" '($1==name || $1==uid) && $3>=65536 {found=1} END {exit !found}' "$dependency" || { echo 'At least 65536 subordinate user/group IDs are required'; return 1; }
   done

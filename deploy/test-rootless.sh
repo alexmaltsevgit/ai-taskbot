@@ -9,6 +9,7 @@ trap 'rm -rf "$sandbox"' EXIT
 export HOME="$sandbox/home"
 mkdir "$HOME"
 trace="$sandbox/install-trace"
+rootful_socket_writable() { [[ ${TEST_ROOTFUL_ACCESS:-} == yes ]]; }
 id() { if [[ $1 == -u ]]; then echo 1000; else echo taskbot; fi; }
 stat() {
   case "${*: -1}" in
@@ -60,7 +61,7 @@ function /usr/bin/dockerd-rootless-setuptool.sh() {
     *) echo 'Unexpected installer flag or action' >&2; return 98 ;;
   esac
 }
-for scenario in TEST_MISSING:newuidmap TEST_SUBIDS_FAIL:yes TEST_LINGER:no TEST_BAD_SERVICE:yes TEST_BAD_CONTEXT:yes TEST_CHECK_FAIL:yes TEST_SMOKE_FAIL:yes TEST_HOME_OWNER:0; do
+for scenario in TEST_ROOTFUL_ACCESS:yes TEST_MISSING:newuidmap TEST_SUBIDS_FAIL:yes TEST_LINGER:no TEST_BAD_SERVICE:yes TEST_BAD_CONTEXT:yes TEST_CHECK_FAIL:yes TEST_SMOKE_FAIL:yes TEST_HOME_OWNER:0; do
   variable=${scenario%:*};value=${scenario#*:}
   if (export "$variable=$value"; rootless_setup) >"$sandbox/result" 2>&1; then
     echo "Invalid prerequisite accepted: $variable"; exit 1
@@ -76,7 +77,9 @@ test "$(wc -l < "$trace")" = 1
 export trace
 {
   declare -f id stat command dockerd-rootless.sh newuidmap newgidmap slirp4netns iptables awk dpkg-query loginctl systemctl rootlesskit docker /usr/bin/dockerd-rootless-setuptool.sh
-  cat deploy/setup-rootless.sh
+  sed '/^if \[\[ -z \${BASH_SOURCE\[0\]:-}/,$d' deploy/setup-rootless.sh
+  declare -f rootful_socket_writable
+  tail -n 1 deploy/setup-rootless.sh
 } | bash -s
 test "$(wc -l < "$trace")" = 1
 echo 'Rootless preflight, endpoint isolation, stdin transport and idempotence tests passed' 
