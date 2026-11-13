@@ -1,0 +1,4 @@
+*
+!issue_pilot/
+!issue_pilot/**
+!Dockerfile

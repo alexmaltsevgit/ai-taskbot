@@ -1,0 +1,43 @@
+services:
+  bot:
+    build:
+      context: .
+      target: bot
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
+      WORKER_URL: http://worker:8090
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
+      GITHUB_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes:
+      - ./config.json:/config/config.json:ro
+      - ./secrets:/run/secrets:ro
+      - bot-data:/data
+    tmpfs: [/tmp]
+    depends_on: [worker]
+  worker:
+    build:
+      context: .
+      target: worker
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.167.1}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+    volumes:
+      - codex-auth:/home/pilot/.codex
+    tmpfs: [/tmp]
+    # Do not publish port 8090, mount bot secrets, Docker socket, or host folders.
+volumes:
+  bot-data:
+  codex-auth:

@@ -1,0 +1,7 @@
+{
+  "-1001234567890": {
+    "users": [123456789],
+    "repositories": ["your-account/project", "your-account/project-api"],
+    "default_repository": "your-account/project"
+  }
+}
