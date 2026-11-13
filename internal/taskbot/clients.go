@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,9 +57,12 @@ func NewHTTPClient(timeout time.Duration) *http.Client {
 }
 
 type GithubClient struct {
-	BaseURL string
-	HTTP    *http.Client
-	Token   func(context.Context) (string, error)
+	// InstallationToken selects the installation-scoped repository listing API.
+	// Keep false for a PAT, including when PAT settings override App settings.
+	InstallationToken bool
+	BaseURL           string
+	HTTP              *http.Client
+	Token             func(context.Context) (string, error)
 }
 
 func (c *GithubClient) request(ctx context.Context, method, path string, input, output any) error {
@@ -67,23 +72,127 @@ func (c *GithubClient) request(ctx context.Context, method, path string, input, 
 	}
 	return requestJSON(ctx, c.HTTP, method, c.BaseURL+path, input, output, map[string]string{"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ai-taskbot"})
 }
+
+const repositoryDiscoveryLimit = 500
+const repositoryPageSize = 100
+
+var repositoryFullName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,38}/[A-Za-z0-9_.-]{1,100}$`)
+
+type repositoryMetadata struct {
+	Repository
+	Archived  bool `json:"archived"`
+	Disabled  bool `json:"disabled"`
+	HasIssues bool `json:"has_issues"`
+}
+
+func validRepositoryName(name string) bool {
+	if !repositoryFullName.MatchString(name) {
+		return false
+	}
+	_, repo, _ := strings.Cut(name, "/")
+	return repo != "." && repo != ".."
+}
 func (c *GithubClient) Repositories(ctx context.Context, names []string) ([]Repository, error) {
+	if len(names) == 1 && names[0] == "*" {
+		return c.discoverRepositories(ctx)
+	}
+	// Validate the complete set before issuing requests, including mixed wildcards.
+	for _, name := range names {
+		if !validRepositoryName(name) {
+			return nil, fmt.Errorf("invalid repository name")
+		}
+	}
 	repos := make([]Repository, 0, len(names))
 	for _, name := range names {
-		var raw struct {
-			Repository
-			Archived  bool `json:"archived"`
-			HasIssues bool `json:"has_issues"`
-		}
+		var raw repositoryMetadata
 		if err := c.request(ctx, http.MethodGet, "/repos/"+name, nil, &raw); err != nil {
 			return nil, err
 		}
-		if raw.Archived || !raw.HasIssues {
+		if !validRepositoryName(raw.FullName) || !strings.EqualFold(name, raw.FullName) {
+			return nil, fmt.Errorf("repository response does not match request")
+		}
+		if raw.Archived || raw.Disabled || !raw.HasIssues {
 			return nil, fmt.Errorf("repository unavailable for issues")
 		}
 		repos = append(repos, raw.Repository)
 	}
 	return repos, nil
+}
+
+// Discovery never requests new scopes. It enumerates the repositories already
+// visible to the selected credential, then excludes disabled/archived repositories
+// and repositories without issues. Fail rather than route on a truncated catalog.
+func (c *GithubClient) discoverRepositories(ctx context.Context) ([]Repository, error) {
+	seen := map[string]Repository{}
+	observed := map[string]bool{}
+	scanned := 0
+	expectedTotal := -1
+	for page := 1; page <= repositoryDiscoveryLimit/repositoryPageSize+1; page++ {
+		query := url.Values{"per_page": {strconv.Itoa(repositoryPageSize)}, "page": {strconv.Itoa(page)}}
+		var batch []repositoryMetadata
+		if c.InstallationToken {
+			var result struct {
+				TotalCount   *int                 `json:"total_count"`
+				Repositories []repositoryMetadata `json:"repositories"`
+			}
+			if err := c.request(ctx, http.MethodGet, "/installation/repositories?"+query.Encode(), nil, &result); err != nil {
+				return nil, err
+			}
+			if result.TotalCount == nil || result.Repositories == nil || *result.TotalCount < 0 {
+				return nil, fmt.Errorf("invalid installation repository response")
+			}
+			if *result.TotalCount > repositoryDiscoveryLimit {
+				return nil, fmt.Errorf("repository discovery exceeds limit of %d", repositoryDiscoveryLimit)
+			}
+			if expectedTotal >= 0 && expectedTotal != *result.TotalCount {
+				return nil, fmt.Errorf("repository catalog changed during discovery; retry")
+			}
+			expectedTotal = *result.TotalCount
+			batch = result.Repositories
+		} else {
+			query.Set("sort", "full_name")
+			query.Set("direction", "asc")
+			if err := c.request(ctx, http.MethodGet, "/user/repos?"+query.Encode(), nil, &batch); err != nil {
+				return nil, err
+			}
+			if batch == nil {
+				return nil, fmt.Errorf("invalid user repository response")
+			}
+		}
+		scanned += len(batch)
+		if len(batch) > repositoryPageSize || scanned > repositoryDiscoveryLimit {
+			return nil, fmt.Errorf("repository discovery exceeds limit of %d", repositoryDiscoveryLimit)
+		}
+		for _, raw := range batch {
+			if !validRepositoryName(raw.FullName) {
+				return nil, fmt.Errorf("invalid repository in discovery response")
+			}
+			key := strings.ToLower(raw.FullName)
+			if observed[key] {
+				return nil, fmt.Errorf("repository catalog contains duplicates; retry")
+			}
+			observed[key] = true
+			if raw.Archived || raw.Disabled || !raw.HasIssues {
+				continue
+			}
+			seen[key] = raw.Repository
+		}
+		if len(batch) < repositoryPageSize {
+			if expectedTotal >= 0 && scanned != expectedTotal {
+				return nil, fmt.Errorf("incomplete installation repository catalog")
+			}
+			if len(seen) == 0 {
+				return nil, fmt.Errorf("no accessible repositories with issues enabled")
+			}
+			repos := make([]Repository, 0, len(seen))
+			for _, repo := range seen {
+				repos = append(repos, repo)
+			}
+			sort.Slice(repos, func(i, j int) bool { return strings.ToLower(repos[i].FullName) < strings.ToLower(repos[j].FullName) })
+			return repos, nil
+		}
+	}
+	return nil, fmt.Errorf("repository discovery did not complete within limit")
 }
 
 var searchWords = regexp.MustCompile(`[\pL\pN]{3,}`)

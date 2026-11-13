@@ -23,14 +23,15 @@ type Model interface {
 	Propose(context.Context, Payload) (Proposal, error)
 }
 type Service struct {
-	Store     *Store
-	Github    Github
-	Model     Model
-	Config    Config
-	Now       func() time.Time
-	mu        sync.Mutex
-	historyMu sync.Mutex
-	history   []historyEntry
+	Store           *Store
+	Github          Github
+	Model           Model
+	Config          Config
+	Now             func() time.Time
+	mu              sync.Mutex
+	historyMu       sync.Mutex
+	history         []historyEntry
+	historySettings map[historyScope]historySetting
 }
 
 func (s *Service) now() time.Time {
@@ -40,7 +41,7 @@ func (s *Service) now() time.Time {
 	return time.Now()
 }
 func (s *Service) Allowed(userID, chatID int64) (Policy, bool) {
-	p, ok := s.Config[strconv.FormatInt(chatID, 10)]
+	p, ok, _ := s.policyFor(chatID)
 	return p, ok && slices.Contains(p.Users, userID)
 }
 func resultFromDraft(d Draft) Result {
@@ -62,7 +63,10 @@ func resultFromDraft(d Draft) Result {
 func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	policy, allowed := s.Allowed(r.UserID, r.ChatID)
+	policy, repos, allowed, err := s.resolvePolicy(ctx, r.UserID, r.ChatID)
+	if err != nil {
+		return Result{}, err
+	}
 	if !allowed {
 		return Result{Kind: "denied"}, nil
 	}
@@ -75,6 +79,9 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	contextJSON, _ := json.Marshal(discussion)
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(r.Instruction+"\x00"+r.Source+string(contextJSON))))
 	if existing, ok := s.Store.BySource(marker); ok {
+		if !s.draftVisible(existing, policy, repos, r.ChatID) {
+			return Result{Kind: "denied"}, nil
+		}
 		expired := existing.State == "preview" && s.now().Sub(existing.Created) > 24*time.Hour
 		changed := existing.State == "preview" && existing.UserID == r.UserID && existing.Fingerprint != fingerprint
 		if expired || changed || existing.State == "cancelled" || existing.State == "expired" {
@@ -92,10 +99,6 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 		return s.prepareEdit(ctx, r, policy, marker, fingerprint, discussion)
 	}
 	explicit, err := ExplicitRepository(r.Instruction, policy.Repositories)
-	if err != nil {
-		return Result{}, err
-	}
-	repos, err := s.Github.Repositories(ctx, policy.Repositories)
 	if err != nil {
 		return Result{}, err
 	}
@@ -186,8 +189,11 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	draft, exists := s.Store.Get(token)
-	policy, allowed := s.Allowed(userID, chatID)
-	if !exists || !allowed || draft.UserID != userID || draft.ChatID != chatID {
+	policy, repos, allowed, err := s.resolvePolicy(ctx, userID, chatID)
+	if err != nil {
+		return Result{}, err
+	}
+	if !exists || !allowed || draft.UserID != userID || draft.ChatID != chatID || !s.draftVisible(draft, policy, repos, chatID) {
 		return Result{Kind: "denied"}, nil
 	}
 	if draft.State != "preview" {
@@ -198,19 +204,8 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 		return Result{Kind: "expired"}, err
 	}
 	p := draft.Proposal
-	if !slices.Contains(policy.Repositories, p.Repository) {
+	if !containsRepository(policy.Repositories, p.Repository) {
 		return Result{Kind: "denied"}, nil
-	}
-	repos, err := s.Github.Repositories(ctx, []string{p.Repository})
-	if err != nil {
-		return Result{}, err
-	}
-	if len(repos) != 1 {
-		return Result{}, fmt.Errorf("repository unavailable")
-	}
-	if repos[0].Private != draft.Private {
-		_, err = s.Store.Transition(token, "preview", "expired", "")
-		return Result{Kind: "expired"}, err
 	}
 	if draft.EditTarget != nil {
 		return s.confirmEdit(ctx, draft)
@@ -244,17 +239,70 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 	return Result{Kind: state, URL: url, Proposal: p}, nil
 }
 func (s *Service) Cancel(token string, userID, chatID int64) (Result, error) {
+	return s.CancelWithContext(context.Background(), token, userID, chatID)
+}
+func (s *Service) CancelWithContext(ctx context.Context, token string, userID, chatID int64) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	draft, exists := s.Store.Get(token)
-	_, allowed := s.Allowed(userID, chatID)
-	if !exists || !allowed || draft.UserID != userID || draft.ChatID != chatID {
+	policy, repos, allowed, err := s.resolvePolicy(ctx, userID, chatID)
+	if err != nil {
+		return Result{}, err
+	}
+	if !exists || !allowed || draft.UserID != userID || draft.ChatID != chatID || !s.draftVisible(draft, policy, repos, chatID) {
 		return Result{Kind: "denied"}, nil
 	}
-	_, err := s.Store.Transition(token, "preview", "cancelled", "")
+	_, err = s.Store.Transition(token, "preview", "cancelled", "")
 	if err != nil {
 		return Result{}, err
 	}
 	draft, _ = s.Store.Get(token)
 	return resultFromDraft(draft), nil
+}
+
+// Exact policies override wildcard policies even when they deny this user.
+func (s *Service) policyFor(chatID int64) (Policy, bool, bool) {
+	if p, ok := s.Config[strconv.FormatInt(chatID, 10)]; ok {
+		return p, true, false
+	}
+	p, ok := s.Config["*"]
+	return p, ok, true
+}
+func (s *Service) resolvePolicy(ctx context.Context, userID, chatID int64) (Policy, []Repository, bool, error) {
+	p, ok, wildcard := s.policyFor(chatID)
+	if !ok || !slices.Contains(p.Users, userID) {
+		return p, nil, false, nil
+	}
+	repositories, err := s.Github.Repositories(ctx, p.Repositories)
+	if err != nil {
+		return p, nil, false, err
+	}
+	var resolved []Repository
+	var names []string
+	discover := len(p.Repositories) == 1 && p.Repositories[0] == "*"
+	for _, repository := range repositories {
+		if (!discover && !containsRepository(p.Repositories, repository.FullName)) || !validRepositoryName(repository.FullName) {
+			continue
+		}
+		if wildcard && repository.Private && !p.AllowPrivateInAnyChat {
+			continue
+		}
+		resolved = append(resolved, repository)
+		names = append(names, repository.FullName)
+	}
+	p.Repositories = names
+	p.DefaultRepository, _ = canonicalRepository(names, p.DefaultRepository)
+	return p, resolved, len(resolved) > 0, nil
+}
+func (s *Service) draftVisible(d Draft, p Policy, repositories []Repository, chatID int64) bool {
+	_, _, wildcard := s.policyFor(chatID)
+	if wildcard && d.Private && !p.AllowPrivateInAnyChat {
+		return false
+	}
+	for _, repository := range repositories {
+		if strings.EqualFold(repository.FullName, d.Proposal.Repository) && repository.Private == d.Private {
+			return true
+		}
+	}
+	return false
 }

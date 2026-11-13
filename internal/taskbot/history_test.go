@@ -14,7 +14,7 @@ func TestRequestWithoutReply(t *testing.T) {
 }
 func TestHistoryBoundariesAndRedaction(t *testing.T) {
 	now := time.Unix(1700000000, 0)
-	s := Service{Config: Config{"1": Policy{HistoryEnabled: true}}, Now: func() time.Time { return now }}
+	s := Service{Config: Config{"1": Policy{HistoryEnabled: true, Users: []int64{1}}}, Now: func() time.Time { return now }}
 	for _, m := range []Message{
 		{ID: 1, Date: now.Unix(), Chat: Chat{ID: 1}, ThreadID: 7, From: &User{ID: 2}, Text: "password=abc payment broken"},
 		{ID: 2, Date: now.Unix(), Chat: Chat{ID: 2}, ThreadID: 7, From: &User{ID: 2}, Text: "other chat"},
@@ -23,7 +23,7 @@ func TestHistoryBoundariesAndRedaction(t *testing.T) {
 	} {
 		s.Remember(m)
 	}
-	r := Request{ChatID: 1, ThreadID: 7, MessageID: 5, SourceID: 5}
+	r := Request{UserID: 1, ChatID: 1, ThreadID: 7, MessageID: 5, SourceID: 5}
 	got := s.Context(r)
 	if len(got) != 1 || got[0].Text != "[REDACTED] payment broken" {
 		t.Fatalf("%+v", got)
@@ -35,33 +35,33 @@ func TestHistoryBoundariesAndRedaction(t *testing.T) {
 }
 func TestHistoryEditsAndOptIn(t *testing.T) {
 	now := time.Now()
-	s := Service{Config: Config{"1": Policy{HistoryEnabled: true}}, Now: func() time.Time { return now }}
+	s := Service{Config: Config{"1": Policy{HistoryEnabled: true, Users: []int64{1}}}, Now: func() time.Time { return now }}
 	m := Message{ID: 1, Date: now.Unix(), Chat: Chat{ID: 1}, From: &User{ID: 2}, Text: "old text"}
 	s.Remember(m)
 	m.Text = "corrected"
 	s.Remember(m)
-	got := s.Context(Request{ChatID: 1, MessageID: 2, SourceID: 2})
+	got := s.Context(Request{UserID: 1, ChatID: 1, MessageID: 2, SourceID: 2})
 	if len(got) != 1 || got[0].Text != "corrected" {
 		t.Fatalf("%+v", got)
 	}
 	p := s.Config["1"]
 	p.HistoryEnabled = false
 	s.Config["1"] = p
-	if len(s.Context(Request{ChatID: 1, MessageID: 2})) != 0 {
+	if len(s.Context(Request{UserID: 1, ChatID: 1, MessageID: 2})) != 0 {
 		t.Fatal("disabled context")
 	}
 }
 
 func TestHistoryBoundsAndReplyAncestors(t *testing.T) {
 	now := time.Now()
-	s := Service{Config: Config{"1": Policy{HistoryEnabled: true}}, Now: func() time.Time { return now }}
+	s := Service{Config: Config{"1": Policy{HistoryEnabled: true, Users: []int64{1}}}, Now: func() time.Time { return now }}
 	for i := int64(1); i <= 210; i++ {
 		s.Remember(Message{ID: i, Date: now.Unix(), Chat: Chat{ID: 1}, From: &User{ID: 2}, Text: "text"})
 	}
 	if len(s.history) != historyTopicLimit {
 		t.Fatal(len(s.history))
 	}
-	got := s.Context(Request{ChatID: 1, MessageID: 211, SourceID: 211})
+	got := s.Context(Request{UserID: 1, ChatID: 1, MessageID: 211, SourceID: 211})
 	if len(got) != contextLimit || got[0].ID != 181 {
 		t.Fatalf("%+v", got)
 	}
@@ -69,7 +69,7 @@ func TestHistoryBoundsAndReplyAncestors(t *testing.T) {
 	old := Message{ID: 1, Date: now.Add(-3 * time.Hour).Unix(), Chat: Chat{ID: 1}, From: &User{ID: 2}, Text: "original"}
 	s.Remember(old)
 	s.Remember(Message{ID: 2, Date: now.Unix(), Chat: Chat{ID: 1}, From: &User{ID: 2}, Text: "correction", Reply: &old})
-	got = s.Context(Request{ChatID: 1, MessageID: 3, SourceID: 2})
+	got = s.Context(Request{UserID: 1, ChatID: 1, MessageID: 3, SourceID: 2})
 	if len(got) != 1 || got[0].ID != 1 {
 		t.Fatalf("missing explicit ancestor: %+v", got)
 	}

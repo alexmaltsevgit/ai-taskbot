@@ -4,7 +4,6 @@ import (
 	"context"
 	"slices"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -30,10 +29,16 @@ type historyEntry struct {
 }
 
 func (s *Service) pruneHistory(now time.Time) {
+	for scope, setting := range s.historySettings {
+		_, allowed := s.Allowed(setting.ActorID, scope.ChatID)
+		if setting.Enabled && (!allowed || !now.Before(setting.Until)) {
+			setting.Enabled = false
+			s.historySettings[scope] = setting
+		}
+	}
 	filtered := make([]historyEntry, 0, len(s.history))
 	for _, entry := range s.history {
-		policy, ok := s.Config[strconv.FormatInt(entry.ChatID, 10)]
-		if ok && policy.HistoryEnabled && now.Sub(time.Unix(entry.Date, 0)) <= historyLifetime {
+		if s.historyEnabled(historyScope{entry.ChatID, entry.ThreadID}, now) && now.Sub(time.Unix(entry.Date, 0)) <= historyLifetime {
 			filtered = append(filtered, entry)
 		}
 	}
@@ -44,8 +49,11 @@ func (s *Service) Remember(m Message) {
 	defer s.historyMu.Unlock()
 	now := s.now()
 	s.pruneHistory(now)
-	policy, ok := s.Config[strconv.FormatInt(m.Chat.ID, 10)]
-	if !ok || !policy.HistoryEnabled || m.From == nil || m.From.IsBot || m.SenderChat != nil || m.Date <= 0 || m.ID <= 0 {
+	scope := historyScope{m.Chat.ID, m.ThreadID}
+	if !s.historyEnabled(scope, now) || m.From == nil || m.From.IsBot || m.SenderChat != nil || m.Date <= 0 || m.ID <= 0 {
+		return
+	}
+	if setting, ok := s.historySettings[scope]; ok && (m.ID <= setting.AfterID || m.Date < setting.Started.Unix()) {
 		return
 	}
 	age := now.Sub(time.Unix(m.Date, 0))
@@ -93,8 +101,8 @@ func (s *Service) Context(r Request) []ContextMessage {
 	defer s.historyMu.Unlock()
 	now := s.now()
 	s.pruneHistory(now)
-	policy, ok := s.Config[strconv.FormatInt(r.ChatID, 10)]
-	if !ok || !policy.HistoryEnabled {
+	_, allowed := s.Allowed(r.UserID, r.ChatID)
+	if !allowed || !s.historyEnabled(historyScope{r.ChatID, r.ThreadID}, now) {
 		return nil
 	}
 	var topic []ContextMessage

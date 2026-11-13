@@ -14,6 +14,7 @@ type Entity struct {
 	Length int    `json:"length"`
 }
 type Message struct {
+	ForwardOrigin   any      `json:"forward_origin,omitempty"`
 	Date            int64    `json:"date"`
 	ThreadID        int64    `json:"message_thread_id"`
 	ID              int64    `json:"message_id"`
@@ -70,10 +71,11 @@ type Payload struct {
 	Issues              []Issue          `json:"issues"`
 }
 type Policy struct {
-	HistoryEnabled    bool     `json:"history_enabled,omitempty"`
-	Users             []int64  `json:"users"`
-	Repositories      []string `json:"repositories"`
-	DefaultRepository string   `json:"default_repository,omitempty"`
+	AllowPrivateInAnyChat bool     `json:"allow_private_in_any_chat,omitempty"`
+	HistoryEnabled        bool     `json:"history_enabled,omitempty"`
+	Users                 []int64  `json:"users"`
+	Repositories          []string `json:"repositories"`
+	DefaultRepository     string   `json:"default_repository,omitempty"`
 }
 type Config map[string]Policy
 type Result struct {

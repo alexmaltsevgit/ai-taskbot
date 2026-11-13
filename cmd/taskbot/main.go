@@ -81,7 +81,7 @@ func run() error {
 	if telegramToken == "" {
 		return fmt.Errorf("TELEGRAM_BOT_TOKEN required")
 	}
-	service := &taskbot.Service{Store: store, Config: config, Github: &taskbot.GithubClient{BaseURL: "https://api.github.com", HTTP: taskbot.NewHTTPClient(45 * time.Second), Token: githubToken}, Model: &taskbot.ModelClient{Endpoint: env("WORKER_URL", "http://worker:8090"), Token: token, HTTP: taskbot.NewHTTPClient(200 * time.Second)}}
+	service := &taskbot.Service{Store: store, Config: config, Github: &taskbot.GithubClient{InstallationToken: os.Getenv("GITHUB_TOKEN") == "", BaseURL: "https://api.github.com", HTTP: taskbot.NewHTTPClient(45 * time.Second), Token: githubToken}, Model: &taskbot.ModelClient{Endpoint: env("WORKER_URL", "http://worker:8090"), Token: token, HTTP: taskbot.NewHTTPClient(200 * time.Second)}}
 	telegram := &taskbot.TelegramClient{BaseURL: "https://api.telegram.org/bot" + telegramToken + "/", HTTP: taskbot.NewHTTPClient(50 * time.Second)}
 	return taskbot.RunBot(ctx, service, telegram)
 }

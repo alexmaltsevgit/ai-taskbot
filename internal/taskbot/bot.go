@@ -107,6 +107,9 @@ func SendResult(ctx context.Context, telegram Telegram, chatID, messageID int64,
 }
 func HandleUpdate(ctx context.Context, update Update, service *Service, telegram Telegram, username string) error {
 	if callback := update.Callback; callback != nil {
+		if callback.From.IsBot {
+			return nil
+		}
 		chatID, userID := callback.Message.Chat.ID, callback.From.ID
 		action, token, ok := strings.Cut(callback.Data, ":")
 		if chatID == 0 || !ok || (action != "create" && action != "cancel") {
@@ -122,7 +125,7 @@ func HandleUpdate(ctx context.Context, update Update, service *Service, telegram
 		if action == "create" {
 			result, err = service.Confirm(ctx, token, userID, chatID)
 		} else {
-			result, err = service.Cancel(token, userID, chatID)
+			result, err = service.CancelWithContext(ctx, token, userID, chatID)
 		}
 		if err != nil && result.Kind == "" {
 			result = Result{Kind: "question", Text: "Операция не завершена. Проверьте GitHub и повторите нажатие позже; неподтверждённое создание автоматически не повторяется."}
@@ -134,6 +137,20 @@ func HandleUpdate(ctx context.Context, update Update, service *Service, telegram
 		return nil
 	}
 	if update.Message == nil {
+		return nil
+	}
+	if action, matched := ExtractContextCommand(*update.Message, username); matched {
+		result := service.ManageContext(*update.Message, action)
+		if result.Kind == "denied" {
+			return nil
+		}
+		m := update.Message
+		if err := SendResult(ctx, telegram, m.Chat.ID, m.ID, result, m.ThreadID); err != nil {
+			if action == "on" {
+				service.ManageContext(*m, "off")
+			}
+			return err
+		}
 		return nil
 	}
 	service.Remember(*update.Message)

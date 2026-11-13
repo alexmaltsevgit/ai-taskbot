@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -28,7 +27,8 @@ func (s *Service) prepareEdit(ctx context.Context, r Request, policy Policy, mar
 	}
 	repository := links[0][1]
 	number, err := strconv.Atoi(links[0][2])
-	if err != nil || !slices.Contains(policy.Repositories, repository) {
+	repository, authorized := canonicalRepository(policy.Repositories, repository)
+	if err != nil || !authorized {
 		return Result{Kind: "denied"}, nil
 	}
 	editor, ok := s.Github.(IssueEditor)
@@ -38,6 +38,10 @@ func (s *Service) prepareEdit(ctx context.Context, r Request, policy Policy, mar
 	repos, err := s.Github.Repositories(ctx, []string{repository})
 	if err != nil {
 		return Result{}, err
+	}
+	_, _, wildcard := s.policyFor(r.ChatID)
+	if wildcard && len(repos) == 1 && repos[0].Private && !policy.AllowPrivateInAnyChat {
+		return Result{Kind: "denied"}, nil
 	}
 	if len(repos) != 1 {
 		return Result{}, fmt.Errorf("repository unavailable")
