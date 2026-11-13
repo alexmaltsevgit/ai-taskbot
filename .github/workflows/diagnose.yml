@@ -1,0 +1,43 @@
+name: Diagnose deployment account
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ai-taskbot-production-deploy
+  cancel-in-progress: false
+jobs:
+  diagnose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    env:
+      DEPLOY_ENABLED: ${{ vars.DEPLOY_ENABLED }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate SSH boundary
+        run: bash deploy/validate-ssh.sh
+      - name: Read dedicated account prerequisites
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          # Repository/environment variables are not automatically masked.
+          printf '::add-mask::%s\n' "$DEPLOY_HOST" "$DEPLOY_USER"
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          unset DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS
+          options=(-i "$ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ssh_dir/known_hosts" -o ConnectTimeout=15 -o LogLevel=ERROR)
+          # Stream the reviewed script through stdin: no remote file is created.
+          ssh "${options[@]}" -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' < deploy/diagnose-server.sh

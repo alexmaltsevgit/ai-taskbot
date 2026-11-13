@@ -1,0 +1,38 @@
+name: ai-taskbot-production
+services:
+  bot:
+    image: ai-taskbot-bot:${RELEASE_SHA:?Set RELEASE_SHA}
+    # Root inside a REQUIRED rootless engine maps to the dedicated host user,
+    # not host root, and can read its 0600 configuration without chmod tricks.
+    user: '0:0'
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
+      WORKER_URL: http://worker:8090
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_INSTALLATION_ID: ${GITHUB_INSTALLATION_ID:-}
+      GITHUB_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+    volumes:
+      - ${DEPLOY_ROOT:?Set DEPLOY_ROOT}/shared/config.json:/config/config.json:ro
+      - ${DEPLOY_ROOT}/shared/secrets:/run/secrets:ro
+      - ${DEPLOY_ROOT}/shared/data:/data
+    tmpfs: [/tmp]
+    depends_on: [worker]
+  worker:
+    image: ai-taskbot-worker:${RELEASE_SHA:?Set RELEASE_SHA}
+    user: '0:0'
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
+      CODEX_MODEL: ${CODEX_MODEL:-}
+    volumes:
+      - ${DEPLOY_ROOT}/shared/codex-auth:/home/pilot/.codex
+    tmpfs: [/tmp]
