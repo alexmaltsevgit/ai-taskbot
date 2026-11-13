@@ -1,4 +1,5 @@
 name: ai-taskbot-production
+x-ai-taskbot-egress: required-v1
 services:
   bot:
     image: ai-taskbot-bot:${RELEASE_SHA:?Set RELEASE_SHA}
@@ -9,7 +10,19 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    networks: [app]
+    dns: [127.0.0.1]
     environment:
+      STRICT_EGRESS: 'true'
+      EGRESS_PROXY_URL: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      HTTPS_PROXY: http://egress:3128
+      ALL_PROXY: http://egress:3128
+      http_proxy: http://egress:3128
+      https_proxy: http://egress:3128
+      all_proxy: http://egress:3128
+      NO_PROXY: worker,localhost,127.0.0.1,::1
+      no_proxy: worker,localhost,127.0.0.1,::1
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN}
       WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
       WORKER_URL: http://worker:8090
@@ -19,10 +32,15 @@ services:
       GITHUB_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
     volumes:
       - ${DEPLOY_ROOT:?Set DEPLOY_ROOT}/shared/config.json:/config/config.json:ro
-      - ${DEPLOY_ROOT}/shared/secrets:/run/secrets:ro
+      - type: bind
+        source: ${DEPLOY_ROOT}/shared/secrets/github-app.pem
+        target: /run/secrets/github-app.pem
+        read_only: true
+        bind:
+          create_host_path: false
       - ${DEPLOY_ROOT}/shared/data:/data
     tmpfs: [/tmp]
-    depends_on: [worker]
+    depends_on: [worker, egress]
   worker:
     image: ai-taskbot-worker:${RELEASE_SHA:?Set RELEASE_SHA}
     user: '0:0'
@@ -30,9 +48,43 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    networks: [app]
+    dns: [127.0.0.1]
     environment:
+      STRICT_EGRESS: 'true'
+      EGRESS_PROXY_URL: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      HTTPS_PROXY: http://egress:3128
+      ALL_PROXY: http://egress:3128
+      http_proxy: http://egress:3128
+      https_proxy: http://egress:3128
+      all_proxy: http://egress:3128
+      NO_PROXY: worker,localhost,127.0.0.1,::1
+      no_proxy: worker,localhost,127.0.0.1,::1
       WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN}
       CODEX_MODEL: ${CODEX_MODEL:-}
     volumes:
       - ${DEPLOY_ROOT}/shared/codex-auth:/home/pilot/.codex
     tmpfs: [/tmp]
+    depends_on: [egress]
+  egress:
+    image: ai-taskbot-bot:${RELEASE_SHA:?Set RELEASE_SHA}
+    command: [egress-proxy]
+    user: '0:0'
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [app, outbound]
+    dns: [127.0.0.1]
+    environment:
+      PROXY_CONFIG_FILE: /run/proxy/proxy.json
+    volumes:
+      - ${DEPLOY_ROOT}/shared/secrets/proxy.json:/run/proxy/proxy.json:ro
+    tmpfs: [/tmp]
+networks:
+  app:
+    internal: true
+    enable_ipv6: false
+  outbound:
+    enable_ipv6: false

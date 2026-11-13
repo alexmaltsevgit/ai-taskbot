@@ -27,6 +27,36 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if mode == "egress-proxy" || mode == "check-proxy-config" {
+		config, err := taskbot.LoadProxyConfig(env("PROXY_CONFIG_FILE", "/run/proxy/proxy.json"))
+		if err != nil {
+			return err
+		}
+		proxy, err := taskbot.NewEgressProxy(config)
+		if err != nil {
+			return err
+		}
+		defer proxy.Close()
+		if mode == "check-proxy-config" {
+			return nil
+		}
+		server := &http.Server{Addr: ":3128", Handler: proxy, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32768}
+		go func() {
+			<-ctx.Done()
+			proxy.Close()
+			shutdown, stop := context.WithTimeout(context.Background(), 10*time.Second)
+			defer stop()
+			_ = server.Shutdown(shutdown)
+		}()
+		if err = server.ListenAndServe(); err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	}
+	externalHTTP, err := taskbot.NewExternalHTTPClient(50 * time.Second)
+	if err != nil {
+		return err
+	}
 	token := os.Getenv("WORKER_TOKEN")
 	if len(token) < 32 {
 		return fmt.Errorf("WORKER_TOKEN must contain at least 32 characters")
@@ -46,7 +76,7 @@ func run() error {
 		return err
 	}
 	if mode != "bot" && mode != "check-config" {
-		return fmt.Errorf("usage: taskbot [bot|worker|check-config]")
+		return fmt.Errorf("usage: taskbot [bot|worker|check-config|egress-proxy|check-proxy-config]")
 	}
 	raw, err := os.ReadFile(env("CONFIG_FILE", "config.json"))
 	if err != nil {
@@ -81,8 +111,8 @@ func run() error {
 	if telegramToken == "" {
 		return fmt.Errorf("TELEGRAM_BOT_TOKEN required")
 	}
-	service := &taskbot.Service{Store: store, Config: config, Github: &taskbot.GithubClient{InstallationToken: os.Getenv("GITHUB_TOKEN") == "", BaseURL: "https://api.github.com", HTTP: taskbot.NewHTTPClient(45 * time.Second), Token: githubToken}, Model: &taskbot.ModelClient{Endpoint: env("WORKER_URL", "http://worker:8090"), Token: token, HTTP: taskbot.NewHTTPClient(200 * time.Second)}}
-	telegram := &taskbot.TelegramClient{BaseURL: "https://api.telegram.org/bot" + telegramToken + "/", HTTP: taskbot.NewHTTPClient(50 * time.Second)}
+	service := &taskbot.Service{Store: store, Config: config, Github: &taskbot.GithubClient{InstallationToken: os.Getenv("GITHUB_TOKEN") == "", BaseURL: "https://api.github.com", HTTP: externalHTTP, Token: githubToken}, Model: &taskbot.ModelClient{Endpoint: env("WORKER_URL", "http://worker:8090"), Token: token, HTTP: taskbot.NewDirectHTTPClient(200 * time.Second)}}
+	telegram := &taskbot.TelegramClient{BaseURL: "https://api.telegram.org/bot" + telegramToken + "/", HTTP: externalHTTP}
 	return taskbot.RunBot(ctx, service, telegram)
 }
 func main() {

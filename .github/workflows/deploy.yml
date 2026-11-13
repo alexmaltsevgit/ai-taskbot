@@ -37,10 +37,11 @@ jobs:
           test "$DEPLOY_PLATFORM" = linux/amd64
           docker build --platform linux/amd64 --target bot -t "ai-taskbot-bot:$GITHUB_SHA" .
           docker build --platform linux/amd64 --target worker -t "ai-taskbot-worker:$GITHUB_SHA" .
+          bash deploy/test-egress-network.sh "ai-taskbot-bot:$GITHUB_SHA" "ai-taskbot-worker:$GITHUB_SHA"
           mkdir bundle
           docker save "ai-taskbot-bot:$GITHUB_SHA" "ai-taskbot-worker:$GITHUB_SHA" | gzip > bundle/images.tar.gz
-          cp deploy/compose.yaml deploy/install-release.sh bundle/
-          (cd bundle && sha256sum images.tar.gz compose.yaml install-release.sh > checksums.txt)
+          cp deploy/compose.yaml deploy/install-release.sh deploy/codex-login.sh deploy/probes/egress.js bundle/
+          (cd bundle && sha256sum images.tar.gz compose.yaml install-release.sh codex-login.sh egress.js > checksums.txt)
       - uses: actions/upload-artifact@v4
         with:
           name: deployment-${{ github.sha }}
@@ -90,5 +91,5 @@ jobs:
           target="$DEPLOY_USER@$DEPLOY_HOST"
           destination="$DEPLOY_ROOT/releases/$RELEASE_SHA"
           ssh "${options[@]}" -p "$DEPLOY_PORT" "$target" "umask 077; mkdir -p '$destination'"
-          scp "${options[@]}" -P "$DEPLOY_PORT" bundle/images.tar.gz bundle/compose.yaml bundle/install-release.sh bundle/checksums.txt "$target:$destination/"
+          scp "${options[@]}" -P "$DEPLOY_PORT" bundle/images.tar.gz bundle/compose.yaml bundle/install-release.sh bundle/codex-login.sh bundle/egress.js bundle/checksums.txt "$target:$destination/"
           ssh "${options[@]}" -p "$DEPLOY_PORT" "$target" "bash '$destination/install-release.sh' '$DEPLOY_ROOT' '$RELEASE_SHA' '$DEPLOY_MODE'"

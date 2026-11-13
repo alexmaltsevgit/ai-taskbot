@@ -17,7 +17,12 @@ docker info --format '{{json .SecurityOptions}}' | grep -q '"name=rootless"' || 
 [[ $(docker info --format '{{.Architecture}}') == x86_64 ]] || { echo 'Only amd64 server is supported'; exit 1; }
 docker compose version >/dev/null
 release="$DEPLOY_ROOT/releases/$RELEASE_SHA"
-[[ -d $release && -f $DEPLOY_ROOT/shared/.env && -f $DEPLOY_ROOT/shared/config.json && -d $DEPLOY_ROOT/shared/secrets ]] || { echo 'Server runtime configuration is missing'; exit 1; }
+[[ -d $release && -f $DEPLOY_ROOT/shared/.env && -f $DEPLOY_ROOT/shared/config.json && -f $DEPLOY_ROOT/shared/secrets/proxy.json && -d $DEPLOY_ROOT/shared/secrets ]] || { echo 'Server runtime configuration is missing'; exit 1; }
+# Mount only the App key, never the secrets directory containing proxy credentials.
+key="$DEPLOY_ROOT/shared/secrets/github-app.pem"
+[[ ! -L $key && ! -d $key ]] || { echo 'Unsafe GitHub App key path'; exit 1; }
+if [[ ! -e $key ]]; then (set -o noclobber; : > "$key"); fi
+[[ -f $key ]] || { echo 'GitHub App key mount is not a regular file'; exit 1; }
 # Prevent concurrent manual and Actions runs, without touching other projects.
 exec 9>"$DEPLOY_ROOT/.deploy.lock"
 flock -n 9 || { echo 'Another deployment is active'; exit 1; }
@@ -31,31 +36,35 @@ gzip -dc images.tar.gz | docker load >/dev/null
 compose() { docker compose --project-name ai-taskbot-production --env-file "$DEPLOY_ROOT/shared/.env" -f "$1/compose.yaml" "${@:2}"; }
 # Do not print expanded configuration: it includes runtime secrets.
 compose "$release" config --quiet
-compose "$release" run --rm --no-deps bot check-config
+compose "$release" run --rm --no-deps --pull never bot check-config
+compose "$release" run --rm --no-deps --pull never egress check-proxy-config
 if [[ $mode == prepare ]]; then
   echo "Images staged. Run the documented Codex device login on the server, then deploy."
   exit 0
 fi
 # Authentication check occurs before stopping any current service. It does not
 # prove model quota/network availability and must not be described as an E2E test.
-compose "$release" run --rm --no-deps worker codex login status >/dev/null 2>&1 || { echo 'Codex login is required; see deployment documentation'; exit 1; }
+compose "$release" run --rm --no-deps --pull never worker codex login status >/dev/null 2>&1 || { echo 'Codex login is required; see deployment documentation'; exit 1; }
 previous=''
 if [[ -f $DEPLOY_ROOT/current ]]; then
   previous=$(cat "$DEPLOY_ROOT/current")
   [[ $previous =~ ^[a-f0-9]{40}$ && -f $DEPLOY_ROOT/releases/$previous/compose.yaml ]] || { echo 'Invalid previous release'; exit 1; }
 else
   # Never adopt pre-existing containers implicitly on the first managed deploy.
-  [[ -z $(docker ps -aq --filter label=com.docker.compose.project=ai-taskbot-production) ]] || { echo 'Existing unmanaged deployment requires reconciliation'; exit 1; }
+  services=$(docker ps -a --filter label=com.docker.compose.project=ai-taskbot-production --format '{{.Label "com.docker.compose.service"}}')
+  while IFS= read -r service; do
+    [[ -z $service || $service == egress ]] || { echo 'Existing unmanaged deployment requires reconciliation'; exit 1; }
+  done <<< "$services"
 fi
 restore() {
-  if [[ -n $previous ]]; then
+  if [[ -n $previous ]] && grep -qx 'x-ai-taskbot-egress: required-v1' "$DEPLOY_ROOT/releases/$previous/compose.yaml"; then
     if ! RELEASE_SHA=$previous compose "$DEPLOY_ROOT/releases/$previous" up -d --no-build --pull never; then
       return 1
     fi
     echo 'Previous images restored; state was not overwritten.'
   else
     if ! compose "$release" stop; then return 1; fi
-    echo 'First deployment stopped; persistent data retained.'
+    echo 'Services stopped; no automatic rollback to an unproxied release. Persistent data retained.'
   fi
 }
 update_started=false
@@ -83,16 +92,23 @@ update_started=true
 # Stop the poller before creating a consistent snapshot. Never restore a snapshot
 # automatically: doing so would forget GitHub operations and permit duplicates.
 if [[ -n $previous ]]; then
-  RELEASE_SHA=$previous compose "$DEPLOY_ROOT/releases/$previous" stop bot
+  RELEASE_SHA=$previous compose "$DEPLOY_ROOT/releases/$previous" stop bot worker
   mkdir -p "$DEPLOY_ROOT/backups"
-  docker run --rm --network none --user 0:0 --entrypoint tar -v "$DEPLOY_ROOT/shared/data:/data:ro" "ai-taskbot-bot:$RELEASE_SHA" -C /data -czf - . >"$DEPLOY_ROOT/backups/state-$(date -u +%Y%m%dT%H%M%SZ)-$RELEASE_SHA.tar.gz"
+  docker run --pull never --rm --network none --user 0:0 --entrypoint tar -v "$DEPLOY_ROOT/shared/data:/data:ro" "ai-taskbot-bot:$RELEASE_SHA" -C /data -czf - . >"$DEPLOY_ROOT/backups/state-$(date -u +%Y%m%dT%H%M%SZ)-$RELEASE_SHA.tar.gz"
 fi
+# Verify the actual rootless topology before starting application processes.
+# These probes use no runtime tokens and print no endpoints or configuration.
+compose "$release" up -d --no-build --pull never egress
+sleep 2
+compose "$release" run --rm --no-deps --pull never worker node -e "$(cat "$release/egress.js")" working
+compose "$release" stop egress
+compose "$release" run --rm --no-deps --pull never worker node -e "$(cat "$release/egress.js")" blocked
 compose "$release" up -d --no-build --pull never
 # Observe sustained process health, not just a successful docker compose command.
 healthy=true
 for attempt in 1 2 3 4 5 6; do
   sleep 5
-  for service in bot worker; do
+  for service in bot worker egress; do
     container=$(compose "$release" ps -q "$service")
     if [[ -z $container ]] || [[ $(docker inspect --format '{{.State.Running}} {{.RestartCount}}' "$container") != 'true 0' ]]; then healthy=false; break; fi
   done
