@@ -1,97 +1,219 @@
 # AI Taskbot
 
-Turn a Telegram reply into a well-scoped GitHub issue. Mention the bot, let it match the project and look for duplicates, review the full draft, then confirm. Self-hosted; Go 1.24+, one static binary, no third-party Go dependencies. Model inference uses the official Codex CLI with your own eligible ChatGPT subscription.
+Самостоятельно размещаемый Telegram-бот, который превращает обсуждение проекта в GitHub issue. Напишите боту в группе, проверьте подготовленный текст и подтвердите публикацию кнопкой. Реплай удобен, но **не обязателен**.
+
+Приложение написано на Go, без сторонних Go-зависимостей. Модель вызывается через официальный Codex CLI с вашей подходящей подпиской ChatGPT. Платный API автоматически не подключается.
+
+## Как пользоваться
+
+Замените `your_bot` на имя своего бота:
 
 ```text
-(reply to the bug report)
-@your_bot создай задачу в my-account/project
+@your_bot создай задачу: при оплате картой возникает ошибка 500
+/issue@your_bot собери задачу по обсуждению оплаты выше
+/issue@your_bot создай задачу в my-account/project по последнему решению
 ```
 
-`/issue@your_bot` as a reply also works. Without an explicit repository the bot uses a configured chat default, then the chat title and repository descriptions. Ambiguous choices produce a question rather than a write. Only configured chats, users and repositories are permitted.
+Те же обращения работают реплаем на сообщение с описанием проблемы. Если проект не указан, бот использует настроенный проект чата, затем сопоставляет название чата с разрешёнными репозиториями и их описаниями. При неоднозначности он задаёт вопрос, а не выбирает наугад. Уточнение нужно отправить новой командой с достаточными деталями; отдельного диалогового состояния вопросов нет.
 
-## What is implemented
+Бот ищет похожие issues, показывает полный текст будущей задачи, репозиторий и предупреждение о публичности. Только автор запроса в том же чате может нажать кнопку подтверждения.
 
-- Telegram mention/command + direct reply, including captions and correct UTF-16 entity handling.
-- Live metadata for the repository allowlist; explicit project takes priority.
-- Two-stage structured model output: routing, then draft and semantic duplicate assessment.
-- GitHub lexical search plus 100 recently updated issues, including closed issues. Search is a **candidate search, not an exhaustive guarantee**; older semantically similar issues may be missed.
-- Full preview with destination and public/private warning. Only the original requester, in the same chat, can confirm or cancel. All writes require this confirmation.
-- Durable JSON state, a single-instance lock, source-level deduplication, expiring confirmations, and a durable pre-write state. A timed-out create is never blindly retried.
-- GitHub App installation auth (preferred) or fine-grained PAT.
-- Separate model worker with no GitHub/Telegram credentials, read-only container filesystem, ephemeral Codex runs, user config ignored, shell/apps/subagents disabled, and bounded input/output/time.
-- Russian interaction messages; issue language follows the request. Prompts are in `internal/taskbot/prompts.go`.
+Результат содержит ссылку и краткое резюме:
+- **Новая**: задача создана.
+- **Дубль**: найдена существующая задача; она не изменяется.
+- **Отредактировано**: явно запрошенные изменения сохранены и проверены чтением GitHub.
 
-## Setup
+Ошибка, уточняющий вопрос и неподтверждённый результат не выдаются за успешную операцию. Если issue ещё нет, ссылку бот не выдумывает.
 
-### 1. Telegram
+### Явное редактирование
 
-Create a bot with **@BotFather**, keep the token secret and add the bot to the group. For arbitrary `@bot` mentions as replies to somebody else's message, disable group Privacy Mode through BotFather and re-add the bot if required. The safer alternative is the explicit `/issue@your_bot` command, which Telegram delivers in privacy mode. Admin privileges are not required.
+```text
+/edit@your_bot https://github.com/my-account/project/issues/42 добавь критерий: повторная оплата не списывает деньги второй раз
+```
 
-When privacy mode is disabled, Telegram can deliver other group messages too; this application ignores messages that aren't addressed to it and does not store the full chat. Tell group participants how the bot works. Do not enable processing for a chat unless its members' project content may be sent to the model provider and the configured GitHub repositories.
+Команда `/edit` должна стоять в начале сообщения. Можно отправить её отдельно или реплаем. Нужна ровно одна полная ссылка на issue разрешённого репозитория. Бот готовит **полный новый заголовок и описание**, показывает их и ждёт кнопку «Сохранить изменения». Статус, исполнители, метки и комментарии не меняются. Обычный запрос на создание и обнаружение дубля не разрешают редактирование.
 
-### 2. GitHub
+Перед сохранением бот повторно читает исходный заголовок и описание. Если их уже изменили, подтверждение устаревает. GitHub не предоставляет в этом потоке атомарную блокировку между чтением и PATCH: не редактируйте эту задачу одновременно с подтверждением. После PATCH бот читает issue и проверяет фактический результат. Неопределённый результат автоматически не повторяется.
 
-Create a GitHub App for the account, request **Metadata: read** and **Issues: read/write**, and install it only on the repositories you want. It needs no webhook, code write, administration, pull request, or organization permissions. Set `GITHUB_APP_ID` and `GITHUB_INSTALLATION_ID`; save its private key as `secrets/github-app.pem` readable by container UID 10001. Do not commit it.
+## Что входит в контекст
 
-For a simpler personal setup, set a fine-grained `GITHUB_TOKEN` with the same selected repositories and permissions. The token takes precedence when both methods are set.
+История включается **отдельно для каждого чата** настройкой `history_enabled: true`. Без неё бот использует только обращение и сообщение из реплая.
 
-### 3. Local configuration
+При включённой истории:
+- сохраняется только текст и подписи сообщений доступных боту людей в настроенном чате, включая участников, которым запрещено запускать бота;
+- сообщения разделены по чатам и Telegram-темам; материал из соседней темы или другого чата не подмешивается;
+- в памяти остаются максимум 200 сообщений на тему и 2000 суммарно, каждое до 2000 символов, не дольше 24 часов; фоновая очистка выполняется раз в минуту;
+- модель получает не всю историю: до 30 сообщений, максимум 16 000 символов. Это последние сообщения за два часа и доступная цепочка ответов исходного сообщения до 10 уровней. Само сообщение из реплая передаётся отдельно;
+- при нехватке бюджета приоритет имеет более свежий текст. Порядок сообщений сохраняется. Модель должна выбрать только относящиеся к запросу факты, учитывать последующие исправления и спрашивать при неопределённости;
+- доступные изменения сообщений обновляют историю, но сами по себе не запускают создание задачи. Telegram не сообщает боту об обычном удалении сообщений, поэтому удалённый текст может оставаться до очистки;
+- история хранится **только в оперативной памяти**, очищается после перезапуска и не включается в резервную копию состояния. Секреты известных форматов маскируются до сохранения, но это не гарантированное удаление всех персональных данных.
+
+Это ограниченный контекст, а не полная память чата. Бот не загружает историю до добавления и не восстанавливает пропущенные сообщения. Даже с отключённым Privacy Mode Telegram не присылает сообщения других ботов. При рестарте могут поступить ещё доступные Telegram ожидающие обновления; старые сообщения ограничиваются тем же сроком хранения.
+
+Распознавание релевантности выполняет модель, а не безошибочный поиск: если в одной теме обсуждают несколько независимых задач, лучше использовать реплай или явно назвать предмет. Текст обсуждения считается недоверенными данными, не разрешением менять репозитории или выполнять команды.
+
+## Установка на сервер
+
+Нужны Linux, Docker Engine с плагином Docker Compose, исходящий HTTPS-доступ к Telegram, GitHub и OpenAI, подходящая подписка ChatGPT. Открывать входящие порты не нужно: используется long polling. Не публикуйте порт сервиса модели 8090.
 
 ```sh
+git clone https://github.com/alexmaltsevgit/ai-taskbot.git
+cd ai-taskbot
 cp .env.example .env
 cp config.example.json config.json
 mkdir -p secrets
 chmod 600 .env
-# Containers use UID/GID 10001. Grant read/traverse without making files public.
-sudo chgrp 10001 config.json secrets
-chmod 640 config.json
-chmod 750 secrets
-# After saving your GitHub App key (skip with PAT auth):
-# sudo chgrp 10001 secrets/github-app.pem
-# chmod 640 secrets/github-app.pem
+```
+
+### 1. Создать Telegram-бота и настроить Privacy Mode
+
+1. Откройте официального **@BotFather** в Telegram.
+2. Выполните `/newbot`, выберите имя и имя пользователя, сохраните токен в `TELEGRAM_BOT_TOKEN` файла `.env`.
+3. Добавьте бота в нужную группу. Права администратора для этого приложения не требуются.
+4. Для чтения обсуждения отправьте **@BotFather** команду `/setprivacy`, выберите бота и нажмите **Disable**.
+5. Удалите бота из группы и добавьте заново, чтобы изменение Privacy Mode применилось к группе.
+6. Если настройка не работает, проверьте статус через `/mybots → ваш бот → Bot Settings → Group Privacy`.
+
+При включённом Privacy Mode явная команда `/issue@your_bot` может доходить до бота, но обычное обсуждение целиком он не получает. Поэтому для контекста необходимы **оба** условия: Privacy Mode отключён и `history_enabled: true` в конфигурации. Обычное `@упоминание` не заменяет эту настройку.
+
+До включения истории предупредите участников: доступный текст группы будет временно храниться на сервере, выбранные сообщения отправляться провайдеру модели, а подтверждённое содержание задачи публиковаться в выбранном GitHub-репозитории. Не подключайте чат, если такого использования его содержимого не разрешили.
+
+### 2. Узнать числовые ID чата и пользователей
+
+Нужны неизменяемые числовые ID, а не имена `@username`. Пока сервис бота **не запущен**, отправьте в группе `/issue@your_bot проверка`. В локальном терминале Bash выполните:
+
+```sh
+read -rs -p 'Токен бота: ' TELEGRAM_BOT_TOKEN; echo
+curl --silent --show-error --config - <<CURL
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+CURL
+unset TELEGRAM_BOT_TOKEN
+```
+
+В JSON найдите `message.chat.id` (у супергруппы обычно отрицательный ID с началом `-100`) и `message.from.id`. Для каждого разрешённого пользователя нужна его команда. Не публикуйте вывод: он содержит сообщения и сведения об участниках. Токен не вставляйте в URL браузера, скриншоты или GitHub. Не запускайте одновременно несколько потребителей `getUpdates`.
+
+Если бот раньше использовал webhook, его нужно отключить у предыдущего сервиса: polling и webhook одновременно не работают.
+
+### 3. Дать доступ к GitHub
+
+Рекомендуемый вариант: создайте GitHub App в настройках своего аккаунта, задайте права репозиториев:
+- **Metadata: Read-only**;
+- **Issues: Read and write**.
+
+Отключите webhook, если он не нужен вашей конфигурации App. Установите приложение только на выбранные репозитории. Права на код, администрирование и организации этому боту не нужны.
+
+Укажите в `.env`:
+- `GITHUB_APP_ID`: идентификатор приложения;
+- `GITHUB_INSTALLATION_ID`: идентификатор установки (виден в URL страницы настройки установленного приложения).
+
+Создайте приватный ключ App и сохраните его как `secrets/github-app.pem`. **Не коммитьте ключ.**
+
+Альтернатива для личного использования: fine-grained PAT в `GITHUB_TOKEN`, ограниченный теми же репозиториями и правами Issues read/write, Metadata read. Если указан токен, он имеет приоритет над GitHub App.
+
+### 4. Конфигурация чатов
+
+Пример `config.json`:
+
+```json
+{
+  "-1001234567890": {
+    "users": [123456789],
+    "repositories": ["my-account/project", "my-account/project-api"],
+    "default_repository": "my-account/project",
+    "history_enabled": true
+  }
+}
+```
+
+Замените все примеры реальными ID и репозиториями. `users` определяет, кто может просить создать/изменить задачу и подтверждать свою операцию. `repositories` ограничивает назначения. `default_repository` необязателен. Отсутствующий `history_enabled` означает `false`; включайте осознанно. Темы одного чата используют одну конфигурацию доступа, но разные буферы истории.
+
+Сгенерируйте общий секрет связи бота и модели:
+
+```sh
 openssl rand -hex 32
 ```
 
-Put the generated value in `WORKER_TOKEN`, fill the Telegram and GitHub settings, and replace the example numeric IDs and repositories in `config.json`. Use immutable Telegram user IDs, not usernames. `default_repository` is optional. Multiple repositories per chat are supported. Adding a repository is an administrator action; model output cannot expand access.
+Запишите значение в `WORKER_TOKEN` файла `.env`. Это не API-ключ модели.
 
-### 4. Sign in using the subscription on the server
+Контейнеры используют UID/GID 10001. Разрешите им чтение конфигурации и ключа, не открывая файлы всем:
+
+```sh
+sudo chgrp 10001 config.json secrets
+chmod 640 config.json
+chmod 750 secrets
+# Только при использовании GitHub App:
+sudo chgrp 10001 secrets/github-app.pem
+chmod 640 secrets/github-app.pem
+```
+
+Файлы `.env`, `config.json`, каталог `secrets` и состояние не должны попадать в Git. После изменения конфигурации перезапускайте сервис.
+
+### 5. Авторизовать Codex через подписку
 
 ```sh
 docker compose build
 docker compose run --rm worker codex login --device-auth
 ```
 
-Open the official login URL printed by Codex on your own browser and enter the one-time code. If required, enable device-code login in your ChatGPT security settings. Do not paste tokens, auth files or passwords into Telegram/GitHub. The auth volume survives container restarts.
+Откройте официальный адрес, который напечатает CLI, в своём браузере и введите одноразовый код. При необходимости разрешите вход по коду устройства в настройках безопасности ChatGPT. Пароль, токены и файл авторизации не отправляйте в Telegram или GitHub.
 
 ```sh
 docker compose run --rm worker codex login status
 docker compose up -d
+docker compose logs --tail=100 bot worker
 ```
 
-This uses the official CLI's saved authentication, not browser-cookie scraping or a reverse-engineered API. A qualifying plan, account/workspace permissions, supported region and sufficient usage allowance are still required. Subscription limits apply; there is no automatic paid API fallback. **The bot does not make a general public model endpoint**: only allowlisted users in your own work chats may request issue preparation. Don't turn one subscription into a resold/shared inference service. For hosted multi-customer use, review current OpenAI terms and official Sign in with ChatGPT options instead.
+Авторизация сохраняется в томе `codex-auth`. Используется официальный CLI, без извлечения cookies или неофициальных API. Действуют доступность плана, региональные ограничения, политика рабочего пространства и лимиты подписки. Не превращайте личную подписку в перепродаваемый публичный сервис; бот предназначен для разрешённых пользователей ваших рабочих чатов.
 
-Official documentation: [headless authentication](https://learn.chatgpt.com/docs/auth), [non-interactive mode and saved auth](https://learn.chatgpt.com/docs/non-interactive-mode), [ChatGPT plan usage for open-source/self-hosted apps](https://developers.openai.com/siwc/token-sharing-open-source).
+Официальные инструкции: [вход на сервере](https://learn.chatgpt.com/docs/auth), [неинтерактивный режим](https://learn.chatgpt.com/docs/non-interactive-mode), [использование плана для самостоятельного размещения](https://developers.openai.com/siwc/token-sharing-open-source).
 
-## Runtime and recovery
+### 6. Проверить после запуска
 
-Only run one bot instance per state volume and Telegram token. Polling avoids inbound ports/certificates. Do not publish the worker's port or expose its token. Long inference requests run serially to limit subscription use. Telegram's pending-update retention is finite; this is a small-team service, not a high-throughput queue.
+1. Участник отправляет обычное сообщение с конкретной проблемой.
+2. Разрешённый пользователь отправляет без реплая `/issue@your_bot создай задачу по проблеме выше`.
+3. Проверьте проект, учтённые факты, отсутствие лишних личных данных и полноту критериев.
+4. Нажмите «Создать issue» и проверьте ссылку с меткой «Новая».
+5. Повторите запрос: проверьте ответ «Дубль» или возврат ранее созданного результата, без второй задачи.
+6. На тестовой задаче проверьте `/edit@your_bot <ссылка> <изменение>`, полный предварительный просмотр и ответ «Отредактировано».
+7. Проверьте, что сообщение из другой темы не используется.
 
-A draft lasts 24 hours. Repeat the original request if Telegram delivery fails: the same source returns its durable draft/result. After cancellation or expiry, repeat the original command to generate a fresh draft. A changed instruction by the original requester replaces an unsubmitted preview and invalidates its old buttons. Created or uncertain records are never replaced automatically.
+Автоматические тесты не заменяют эту проверку с вашими учётными данными. Реальная авторизация, серверный запуск и запись в рабочие issues в рамках разработки не выполняются.
 
-If GitHub creation times out, the record becomes `uncertain` (or `creating` after a process crash). **Do not delete the record and immediately retry.** An administrator should inspect GitHub for the hidden `issue-pilot-source:<hash>` marker recorded in the JSON state file, including recently created issues. If found, record its URL and mark `created`; only reset to `preview` after confirming no issue was created. The app deliberately does not automate this uncertain financial-free but externally visible write.
+## Хранение и восстановление
 
-Keep the state volume: losing it weakens duplicate protection. Back it up securely; drafts can contain private project information. Completed, cancelled and expired draft bodies are not automatically purged in this initial version; define your retention policy before deployment. Logs contain operation outcomes and update IDs, not raw messages/tokens.
+Запускайте только один экземпляр с одним Telegram-токеном и томом `bot-data`. Блокировка защищает файл состояния. История обсуждения в памяти и долговременные записи операций — разные вещи.
 
-## Limitations and trust boundaries
+В `/data/state.json` сохраняются черновики и результаты для защиты от повторных действий. Запись атомарна: файл с правами 0600, fsync, переименование, fsync каталога. Перед GitHub POST/PATCH записывается барьер `creating`. Срок кнопок подтверждения — 24 часа.
 
-- Text and captions only. Images, documents, videos and voice are **not** downloaded or interpreted; the bot says when attachment details are missing.
-- No automatic codebase inspection. It uses approved repository names/descriptions and issue candidates, not source code. It must not invent file paths or claim tests ran.
-- Prompt-injection resistance relies on code allowlists, schemas, explicit confirmation and process isolation, not a promise that prompts are infallible.
-- Secret-pattern redaction is best effort. Read the draft, especially for public repositories. The whole approved issue body is shown before creation.
-- Docker isolation reduces blast radius; the worker still holds its own Codex credentials. Do not mount personal home folders or add plugins/MCP servers. Keep Codex and the host patched.
-- The current machine's tests run without real Telegram/GitHub writes or model inference. Server credentials and a real end-to-end test are needed before calling the deployment operational.
+Черновики, включая исходное содержимое редактируемой задачи, пока не удаляются автоматически. Защитите сервер и резервные копии, определите политику хранения. Отключение истории не удаляет уже опубликованные issues и долговременные записи операций. Резервные копии могут содержать приватную информацию.
 
-## Development
+При `uncertain` или оставшемся после сбоя `creating` **не удаляйте запись и не повторяйте запрос вслепую**. Для создания администратор сверяет GitHub, в том числе скрытый маркер `issue-pilot-source:<hash>` из состояния. Для редактирования сверяется конкретный issue и ожидаемые заголовок/описание. Восстановление состояния выполняйте только после выяснения фактического результата и при остановленном боте.
+
+Новая инструкция к тому же исходному сообщению заменяет только ещё не подтверждённый черновик того же автора; старые кнопки перестают работать. Созданные и неопределённые операции не заменяются автоматически. Повторная новая команда редактирования имеет собственный идентификатор операции.
+
+Не удаляйте тома командой `docker compose down -v` без осознанного решения: потеря состояния ослабляет защиту от дублей, потеря тома авторизации требует повторного входа.
+
+## Ограничения и безопасность
+
+- Анализируются текст и подписи. Фото, документы, видео и голосовые сообщения не скачиваются и не расшифровываются.
+- Бот не читает исходный код репозиториев. Модель не должна выдумывать пути, архитектуру или результаты тестов.
+- Поиск дублей использует текстовый поиск GitHub и последние 100 обновлённых issues, включая закрытые. Это поиск кандидатов, не гарантия нахождения всех старых семантических дублей.
+- Защита от инструкций в переписке строится на списках доступа, схеме ответа, изоляции и подтверждении, а не на обещании безошибочного промпта. Проверяйте текст, особенно перед публикацией в публичный репозиторий.
+- Сервис модели не получает GitHub/Telegram-токены. Его Codex CLI имеет собственную авторизацию; не монтируйте личные домашние каталоги, Docker socket, плагины или MCP-серверы.
+- Запросы выполняются последовательно. Во время долгого ответа новые сообщения могут ждать в Telegram; сообщения, пришедшие после начала подготовки, не изменяют уже показанный черновик.
+- Сборка ориентирована на Linux. Код использует flock и группы процессов.
+
+## Если что-то не работает
+
+- **Бот молчит:** проверьте токен, числовые ID в `users` и ключе чата, имя команды, Privacy Mode, единственный polling-процесс и отсутствие webhook.
+- **Не знает обсуждение:** проверьте `history_enabled`, отключение Privacy Mode и повторное добавление в группу. История могла ещё не накопиться, очиститься, не попасть в лимит или относиться к другой теме. Укажите детали либо используйте реплай.
+- **Ошибка GitHub:** проверьте установку App на нужный репозиторий, ID установки, права Issues, срок PAT, наличие issues и отсутствие архивации репозитория.
+- **Ошибка модели:** проверьте `codex login status`, лимиты подписки и доступность сервиса. Платного резервного API нет.
+- **Permission denied:** проверьте владельца/группу конфигурации и ключа, доступ UID/GID 10001 к каталогам.
+- **Подтверждение устарело:** повторите команду; для редактирования заново прочитайте изменения другого участника. Не обходите состояние неопределённой операции.
+- **Нет ссылки при ошибке:** это намеренно; бот не заявляет об операции, которую не подтвердил.
+
+## Разработка
 
 ```sh
 go test -race ./...
@@ -99,12 +221,10 @@ go vet ./...
 go build ./cmd/taskbot
 ```
 
-No API keys or accounts are needed for tests. Linux is the deployment target (the instance lock uses flock). HTTP clients are isolated at the boundary; application tests exercise real parsing, durable state transitions and orchestration. CI also builds both container images.
+Нужен Go 1.24+. Тесты не требуют реальных токенов. CI проверяет форматирование, race-тесты, vet, статическую сборку и оба Docker-образа. Промпты находятся в `internal/taskbot/prompts.go`.
 
-See [architecture](docs/architecture.md) and [review](docs/review.md).
+Технические заметки: [архитектура](docs/architecture.md), [ревью](docs/review.md).
 
-## Migration from the initial Python implementation
+### Переход с первоначальной Python-версии
 
-All application code is now Go; Python and OpenSSL signing subprocesses are removed. The Go standard library signs GitHub App JWTs. State is stored in `/data/state.json` using a 0600 temporary file, fsync, atomic rename and directory fsync. The creating barrier is persisted before any GitHub POST. The bot exits on a state-write failure rather than risking duplicate delivery.
-
-The earlier SQLite file is **not automatically imported**. If the Python version was already deployed, stop it, back up its database and reconcile all pending/uncertain operations before starting this version. Do not run both implementations against the same Telegram bot. Starting with empty state loses the local deduplication history; GitHub candidate search alone is not an equivalent replacement. Keep the old database until migration/reconciliation is complete. The Codex auth volume and existing local config remain compatible.
+Приложение полностью на Go; Python и subprocess для подписи GitHub JWT удалены. Старый SQLite-файл автоматически не импортируется. Если Python-версия уже использовалась, остановите её, сохраните базу и сверяйте незавершённые операции перед переходом. Не запускайте обе версии с одним ботом. Пустое состояние теряет локальную историю защиты от дублей; поиск GitHub не равноценен её сохранению. Том авторизации Codex совместим.

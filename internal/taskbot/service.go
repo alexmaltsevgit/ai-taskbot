@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -22,12 +23,14 @@ type Model interface {
 	Propose(context.Context, Payload) (Proposal, error)
 }
 type Service struct {
-	Store  *Store
-	Github Github
-	Model  Model
-	Config Config
-	Now    func() time.Time
-	mu     sync.Mutex
+	Store     *Store
+	Github    Github
+	Model     Model
+	Config    Config
+	Now       func() time.Time
+	mu        sync.Mutex
+	historyMu sync.Mutex
+	history   []historyEntry
 }
 
 func (s *Service) now() time.Time {
@@ -45,7 +48,15 @@ func resultFromDraft(d Draft) Result {
 	if state == "creating" {
 		state = "uncertain"
 	}
-	return Result{Kind: state, Token: d.Token, URL: d.URL, Proposal: d.Proposal, Private: d.Private}
+	url := d.URL
+	editNumber := 0
+	if d.EditTarget != nil {
+		editNumber = d.EditTarget.Number
+		if url == "" {
+			url = d.EditTarget.URL
+		}
+	}
+	return Result{EditNumber: editNumber, Kind: state, Token: d.Token, URL: url, Proposal: d.Proposal, Private: d.Private}
 }
 
 func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
@@ -55,8 +66,14 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	if !allowed {
 		return Result{Kind: "denied"}, nil
 	}
-	marker := SourceMarker(r.ChatID, r.SourceID)
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(r.Instruction+"\x00"+r.Source)))
+	sourceID := r.SourceID
+	if r.Edit {
+		sourceID = r.MessageID
+	}
+	marker := SourceMarker(r.ChatID, sourceID)
+	discussion := s.Context(r)
+	contextJSON, _ := json.Marshal(discussion)
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(r.Instruction+"\x00"+r.Source+string(contextJSON))))
 	if existing, ok := s.Store.BySource(marker); ok {
 		expired := existing.State == "preview" && s.now().Sub(existing.Created) > 24*time.Hour
 		changed := existing.State == "preview" && existing.UserID == r.UserID && existing.Fingerprint != fingerprint
@@ -70,6 +87,9 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	}
 	if strings.TrimSpace(r.Source) == "" {
 		return Result{Kind: "question", Text: "Добавьте текстовое описание: вложения пока не анализируются."}, nil
+	}
+	if r.Edit {
+		return s.prepareEdit(ctx, r, policy, marker, fingerprint, discussion)
 	}
 	explicit, err := ExplicitRepository(r.Instruction, policy.Repositories)
 	if err != nil {
@@ -87,7 +107,7 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	if preferred == "" {
 		preferred = policy.DefaultRepository
 	}
-	payload := Payload{Instruction: RedactSecrets(r.Instruction), QuotedMessage: RedactSecrets(r.Source), ChatTitle: r.ChatTitle, Repositories: repos, PreferredRepository: preferred, HasUnreadAttachment: r.HasAttachment, Issues: []Issue{}}
+	payload := Payload{Discussion: discussion, Instruction: RedactSecrets(r.Instruction), QuotedMessage: RedactSecrets(r.Source), ChatTitle: r.ChatTitle, Repositories: repos, PreferredRepository: preferred, HasUnreadAttachment: r.HasAttachment, Issues: []Issue{}}
 	routing, err := s.Model.Propose(ctx, payload)
 	if err != nil {
 		return Result{}, err
@@ -107,7 +127,7 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	}
 	for _, issue := range candidates {
 		if strings.Contains(issue.Body, marker) {
-			return Result{Kind: "duplicate", URL: issue.URL}, nil
+			return Result{Kind: "duplicate", URL: issue.URL, Proposal: Proposal{Title: issue.Title, Body: issue.Body}}, nil
 		}
 	}
 	selected := Repository{}
@@ -136,12 +156,15 @@ func (s *Service) Prepare(ctx context.Context, r Request) (Result, error) {
 	if proposal.DuplicateNumber != nil {
 		for _, issue := range candidates {
 			if issue.Number == *proposal.DuplicateNumber {
-				return Result{Kind: "duplicate", URL: issue.URL}, nil
+				return Result{Kind: "duplicate", URL: issue.URL, Proposal: Proposal{Title: issue.Title, Body: issue.Body}}, nil
 			}
 		}
 	}
 	proposal.Title = RedactSecrets(proposal.Title)
-	proposal.Body = RedactSecrets(proposal.Body)
+	proposal.Body = strings.TrimSpace(sourceTags.ReplaceAllString(RedactSecrets(proposal.Body), ""))
+	if err = ValidateProposal(proposal, []string{selected.FullName}, candidates); err != nil {
+		return Result{}, err
+	}
 	bytes := make([]byte, 18)
 	if _, err = rand.Read(bytes); err != nil {
 		return Result{}, err
@@ -189,6 +212,9 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 		_, err = s.Store.Transition(token, "preview", "expired", "")
 		return Result{Kind: "expired"}, err
 	}
+	if draft.EditTarget != nil {
+		return s.confirmEdit(ctx, draft)
+	}
 	candidates, err := s.Github.Candidates(ctx, p.Repository, p.Title)
 	if err != nil {
 		return Result{}, err
@@ -196,7 +222,7 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 	for _, issue := range candidates {
 		if strings.Contains(issue.Body, draft.Source) {
 			_, err = s.Store.Transition(token, "preview", "created", issue.URL)
-			return Result{Kind: "created", URL: issue.URL}, err
+			return Result{Kind: "created", URL: issue.URL, Proposal: Proposal{Title: issue.Title, Body: issue.Body}}, err
 		}
 	}
 	claimed, err := s.Store.Transition(token, "preview", "creating", "")
@@ -215,7 +241,7 @@ func (s *Service) Confirm(ctx context.Context, token string, userID, chatID int6
 	if _, err = s.Store.Transition(token, "creating", state, url); err != nil {
 		return Result{Kind: "uncertain"}, err
 	}
-	return Result{Kind: state, URL: url}, nil
+	return Result{Kind: state, URL: url, Proposal: p}, nil
 }
 func (s *Service) Cancel(token string, userID, chatID int64) (Result, error) {
 	s.mu.Lock()

@@ -1,13 +1,27 @@
-# Architecture and decisions
+# Архитектура и решения
 
-The owner requested a public, self-hosted Telegram bot that converts a replied message to GitHub issues, infers the project from explicit names or chat titles, searches duplicates, and uses subscription-based model authentication.
+Детерминированный Go-сервис управляет Telegram, списками доступа и GitHub. Отдельный worker вызывает официальный Codex CLI с авторизацией по подписке. Модель возвращает только структурированный проект задачи, без полномочий совершать действия.
 
-The implementation uses a deterministic Go control plane and an isolated Codex CLI worker. A direct API-key service would be simpler but does not meet the subscription preference. A model with direct GitHub tools would be more flexible but would unnecessarily combine untrusted chat content and repository write authority. Here the model only returns a proposal.
+## Контекст
 
-Flow: authorized mention/reply → source extraction/redaction → allowed repository metadata → routing proposal → duplicate candidates → final proposal → durable atomic JSON draft → full Telegram preview → requester confirmation → visibility/marker recheck → atomic creating state → one GitHub POST → durable result.
+Полученные сообщения настроенных чатов попадают в ограниченный буфер памяти только при явном `history_enabled`. Боты и анонимные отправители исключены. Ключ изоляции: chat ID + message_thread_id. Отредактированные сообщения заменяют предыдущую версию, но не запускают действия. Новые запросы доступны только пользователям из списка доступа. Другие участники могут давать факты для контекста, но не разрешения.
 
-The public repository contains only generic code and synthetic examples. Production repository names, group IDs, credentials and message content belong in local configuration/state. No external account or deployment is provisioned by the source code.
+TTL — 24 часа, 200 сообщений на тему, 2000 суммарно, 2000 символов на сообщение. Очистка выполняется при обращениях и раз в минуту в фоне. Для модели выбираются до 30 сообщений и 16 000 символов: доступные предки реплая (до 10) и свежая двухчасовая дискуссия. Модель отбирает относящиеся к задаче факты, учитывает исправления, спрашивает при неоднозначности. Это ограниченная эвристика, не гарантия полноты.
 
-Non-goals: autonomous issue editing/closure, customer-facing inference hosting, voice/image recognition, source-code access, deployment to a user's server without credentials, and guaranteed global semantic duplicate recall.
+## Создание
 
-The Go rewrite uses only the standard library, including RSA signing for GitHub App tokens. JSON snapshots replace the former SQLite backend without changing the write-ahead creating barrier. Linux file locking prevents two pollers sharing state.
+Явное обращение с реплаем или без → проверка пользователя → извлечение исходного текста и контекста → разрешённые репозитории → выбор проекта → кандидаты дублей → окончательный проект → атомарно сохранённый черновик → полный предварительный просмотр → подтверждение автора → повторная проверка публичности и маркера → долговременный барьер creating → один POST → сохранённый результат.
+
+## Редактирование
+
+Только явная команда /edit с одной ссылкой на разрешённый issue → чтение точной задачи (не PR) → предложение полного изменённого заголовка/описания → сохранённый черновик с исходной версией → полный предварительный просмотр → подтверждение → повторное чтение исходника и проверка публичности → барьер creating → один PATCH → чтение результата → edited только при совпадении.
+
+Исходные маркеры защиты от дублей сохраняются приложением. Остальные поля issue не меняются. При внешнем изменении заголовка или описания до подтверждения черновик устаревает. Между проверкой и PATCH остаётся ограниченное окно конкурентной записи, поскольку атомарная блокировка GitHub здесь недоступна. Неопределённая запись не повторяется автоматически.
+
+## Хранение и безопасность
+
+JSON-снимки хранят только операции, а не окружающую историю. Сохранение: временный файл 0600, fsync, атомарное переименование, fsync каталога. Flock защищает от второго экземпляра, mutex — от параллельных операций. История имеет отдельный mutex, чтобы очистка не ждала завершения inference.
+
+В публичном репозитории только код и синтетические примеры. Реальные ID, секреты и сообщения находятся в локальных конфигурации/памяти/состоянии. Регулярные выражения маскируют известные секреты, но не заменяют проверку перед публикацией. Модель не получает GitHub/Telegram-секреты.
+
+Не входят в проект: автономное изменение задач, закрытие issues, универсальная модель для внешних клиентов, распознавание вложений, чтение исходного кода, гарантированное нахождение всех семантических дублей и автоматическая установка на сервер пользователя.
