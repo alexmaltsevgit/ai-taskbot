@@ -8,7 +8,11 @@ mode=${3:?prepare or deploy}
 [[ $DEPLOY_ROOT =~ ^/[a-zA-Z0-9_/-]+$ && $DEPLOY_ROOT != / && $DEPLOY_ROOT != */ ]] || exit 1
 [[ $RELEASE_SHA =~ ^[a-f0-9]{40}$ ]] || exit 1
 [[ $mode == prepare || $mode == deploy ]] || exit 1
-[[ $(id -u) != 0 ]] || { echo 'Root SSH deployment is forbidden'; exit 1; }
+uid=$(id -u)
+[[ $uid != 0 ]] || { echo 'Root SSH deployment is forbidden'; exit 1; }
+export XDG_RUNTIME_DIR="/run/user/$uid"
+export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG
 docker info --format '{{json .SecurityOptions}}' | grep -q '"name=rootless"' || { echo 'A dedicated rootless Docker engine is required'; exit 1; }
 [[ $(docker info --format '{{.Architecture}}') == x86_64 ]] || { echo 'Only amd64 server is supported'; exit 1; }
 docker compose version >/dev/null

@@ -6,7 +6,7 @@
 
 На сервере с другими сервисами нельзя передавать GitHub Actions существующий root-ключ, добавлять deploy-пользователя в группу `docker` rootful-демона или давать ему общий `sudo`. Такой доступ практически равен root-доступу ко всем сервисам.
 
-Данный вариант требует **отдельного пользователя без sudo/группы docker и отдельного rootless Docker engine**. Скрипт проверяет rootless и запрещает SSH-пользователя root. Уже установленный обычный Docker **не означает**, что это условие выполнено. Если rootless отсутствует, деплой блокируется. Установка отдельного пользователя/демона, lingering, SSH-ключей и необходимые изменения системных настроек сначала согласуются с владельцем; workflow ничего из этого не устанавливает.
+Данный вариант требует **отдельного пользователя без sudo/группы docker и отдельного rootless Docker engine**. Скрипт проверяет rootless и запрещает SSH-пользователя root. Уже установленный обычный Docker **не означает**, что это условие выполнено. Если rootless отсутствует, деплой блокируется. Установка отдельного пользователя/демона, lingering, SSH-ключей и необходимые изменения системных настроек сначала согласуются с владельцем; основной deploy-workflow ничего из этого не устанавливает. Отдельный ручной **Setup isolated rootless Docker** после согласования может настроить только пользовательский rootless-сервис через уже установленный официальный инструмент, как описано ниже.
 
 Контейнеры работают с UID 0 **внутри rootless engine**, который отображается в UID выделенного пользователя хоста, а не в host root. Так они читают конфигурацию 0600 и записывают собственные данные 0700 без выдачи доступа другим пользователям. Файловая система контейнеров read-only, все capabilities отключены, включён no-new-privileges. Этот Compose-файл нельзя использовать с rootful Docker напрямую.
 
@@ -57,6 +57,35 @@ Workflow **Diagnose deployment account** запускается вручную �
 Он передаёт проверенный скрипт по stdin SSH, не создавая файлов на сервере. Читает текущий UID/группы, ядро и архитектуру без hostname, наличие/права user runtime directory, наличие инструментов rootless/uidmap/slirp4netns и версии установленных клиентов/пакетов. `systemctl --user show` читает только LoadState/ActiveState/SubState; journal и содержимое конфигурации/секретов не выводятся. `loginctl show-user` читает только Linger/State.
 
 Это не установка и не запуск сервисов: нет sudo, setup/install, изменения SSH/systemd/firewall, подключения к rootful Docker или доступа к соседним контейнерам. Неизвестный SSH host key по-прежнему блокирует подключение. Отсутствие runtime directory, user service manager или инструментов выводится как результат диагностики, а не исправляется автоматически. После результата отдельно согласуется необходимый bootstrap.
+
+## Установка rootless после диагностики и согласования
+
+Отдельный ручной workflow **Setup isolated rootless Docker** запускается только на `main`, через `production`, с теми же SSH secrets и `DEPLOY_ENABLED=true`. Он не требует runtime `.env` и не запускает приложение. Используйте его только после разрешения владельца на выделенный rootless-сервис.
+
+Предварительные условия проверяются до вызова установщика: непривилегированный пользователь и принадлежащий ему home, каталог `/run/user/<UID>` с правильным владельцем и правами 0700, user systemd/D-Bus, включённый lingering, минимум 65536 subordinate UID и GID, наличие `newuidmap`, `newgidmap`, `slirp4netns`, `rootlesskit`, `iptables` и официального `/usr/bin/dockerd-rootless-setuptool.sh` из установленного пакета `docker-ce-rootless-extras`. Если чего-либо нет, workflow завершается без попытки установки сервиса.
+
+На Ubuntu недостающие подтверждённые пакеты устанавливает администратор отдельно, после согласования:
+
+```sh
+apt-get update
+apt-get install --no-upgrade --no-install-recommends -y uidmap slirp4netns
+```
+
+Не выполняйте общий upgrade и не меняйте работающий rootful Docker. Если не работают user D-Bus/systemd, сначала исследуйте причину; иногда нужен пакет `dbus-user-session`. Если отсутствуют iptables/доступные namespaces или lingering, не обходите проверки: согласуйте конкретное недостающее действие. Этот workflow не выполняет sudo, apt, modprobe, sysctl, изменение firewall или rootful-сервисов.
+
+Скрипт вызывает официальный `check` и smoke test `rootlesskit true`, затем официальный `install`. **`--force` не используется**: в официальном инструменте он не только игнорирует доступный rootful socket, но и позволяет продолжить после неуспешного smoke test. Работающий rootful Docker других сервисов сам по себе не мешает установке, если его socket недоступен этому пользователю. Доступный rootful socket считается лишними полномочиями и блокирует workflow.
+
+Установщик создаёт/запускает/включает только пользовательский `docker.service` и контекст `rootless`. Чужой существующий user unit или контекст с другим endpoint отклоняется. Уже корректно настроенный активный/включённый rootless-сервис повторно не устанавливается. Проверяется, что собственный socket отвечает с `name=rootless`. Если официальный установщик завершился частично, скрипт не удаляет автоматически сервис/данные: нужен осмотр, затем безопасный повтор.
+
+Официальное поведение проверено по [исходнику Docker/Moby](https://github.com/moby/moby/blob/master/contrib/dockerd-rootless-setuptool.sh); [документация rootless Docker](https://docs.docker.com/engine/security/rootless/). Используется установленный пакет, ничего не скачивается и не исполняется из сети во время setup.
+
+Для каждой SSH-сессии deployment-скрипт задаёт `DOCKER_HOST=unix:///run/user/<UID>/docker.sock` и снимает унаследованные `DOCKER_CONTEXT`/TLS overrides. Поэтому отсутствие настроек в shell profile не переключает деплой на rootful daemon. Для ручных команд используйте такую же явную привязку:
+
+```sh
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG
+```
 
 ## Подготовка каталога после согласования доступа
 
@@ -111,4 +140,4 @@ docker compose --project-name ai-taskbot-production \
 
 ## Проверки разработки
 
-`bash deploy/test-deploy.sh` проверяет аргументы, синтаксис и сценарии staging/deploy/rootful rejection/rollback через mock Docker CLI без доступа к настоящему Docker socket. Go race-тесты и vet выполняются отдельно. Реальное SSH-подключение, rootless engine и live-сценарий проверяются только после настройки и предоставления разрешённого доступа.
+`bash deploy/test-deploy.sh` проверяет аргументы, синтаксис и сценарии staging/deploy/rootful rejection/rollback через mock Docker CLI без доступа к настоящему Docker socket. Отдельный `bash deploy/test-rootless.sh` проверяет отсутствие установки при недостающих prerequisites, отказ от чужого context/service, изоляцию endpoint, повторный запуск и точный stdin-транспорт `bash -s` через mocks. Go race-тесты и vet выполняются отдельно. Реальное SSH-подключение, rootless engine и live-сценарий проверяются только после настройки и предоставления разрешённого доступа.
