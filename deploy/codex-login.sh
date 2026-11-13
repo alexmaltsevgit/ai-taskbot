@@ -10,8 +10,11 @@ uid=$(id -u)
 [[ $uid != 0 ]] || { echo 'Root login helper is forbidden'; exit 1; }
 export XDG_RUNTIME_DIR="/run/user/$uid" DOCKER_HOST="unix:///run/user/$uid/docker.sock"
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG
-docker info --format '{{json .SecurityOptions}}' | grep -q '"name=rootless"' || exit 1
 release="$DEPLOY_ROOT/releases/$RELEASE_SHA"
+# sudo -u -H may retain an inaccessible caller directory (for example /root).
+# Compose inspects the current directory even when all file paths are absolute.
+cd "$release"
+docker info --format '{{json .SecurityOptions}}' | grep -q '"name=rootless"' || exit 1
 grep -qx 'x-ai-taskbot-egress: required-v1' "$release/compose.yaml" || { echo 'This release does not enforce proxy isolation'; exit 1; }
 [[ -f $DEPLOY_ROOT/shared/secrets/proxy.json ]] || { echo 'Runtime proxy configuration is missing'; exit 1; }
 exec 9>"$DEPLOY_ROOT/.deploy.lock"

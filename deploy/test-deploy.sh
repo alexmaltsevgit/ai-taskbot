@@ -40,6 +40,10 @@ export DEPLOY_TEST_TRACE="$sandbox/trace"
 cat > "$sandbox/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${TEST_EXPECT_CWD:-} && $PWD != "$TEST_EXPECT_CWD" ]]; then
+  echo 'Docker invoked outside prepared release directory' >&2
+  exit 22
+fi
 printf '%s\n' "$*" >> "$DEPLOY_TEST_TRACE"
 case "$1" in
  info)
@@ -54,7 +58,7 @@ case "$1" in
   if [[ ${TEST_NETWORK_FAIL:-} == yes && $* == *' worker node -e '* ]]; then exit 21; fi
   if [[ $* == *' ps -q '* ]]; then
     if [[ ${TEST_PS_FAIL:-} == yes ]]; then exit 17; fi
-    echo container
+    if [[ ${TEST_APP_STOPPED:-} != yes ]]; then echo container; fi
   fi
   if [[ ${TEST_RESTORE_FAIL:-} == yes && $* == *"releases/$TEST_PREVIOUS/compose.yaml up "* ]]; then exit 18; fi ;;
  *) exit 1 ;;
@@ -89,6 +93,11 @@ release="$DEPLOY_ROOT/releases/$RELEASE_SHA"
 cp deploy/compose.yaml deploy/install-release.sh deploy/codex-login.sh deploy/probes/egress.js "$release/"
 printf 'mock-images' | gzip > "$release/images.tar.gz"
 (cd "$release" && sha256sum images.tar.gz compose.yaml install-release.sh codex-login.sh egress.js > checksums.txt)
+# Start in a different caller directory and require every Docker invocation,
+# including the initial info probe, to use the prepared release directory.
+(cd "$sandbox" && TEST_EXPECT_CWD="$release" TEST_APP_STOPPED=yes bash "$release/codex-login.sh" "$DEPLOY_ROOT" "$RELEASE_SHA")
+grep -q 'worker codex login --device-auth' "$DEPLOY_TEST_TRACE"
+echo 'Login helper working-directory regression passed'
 bash deploy/install-release.sh "$DEPLOY_ROOT" "$RELEASE_SHA" prepare
 test ! -f "$DEPLOY_ROOT/current"
 test "$(stat -c %a "$DEPLOY_ROOT/shared/data")" = 700
