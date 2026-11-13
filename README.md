@@ -1,6 +1,6 @@
 # AI Taskbot
 
-Turn a Telegram reply into a well-scoped GitHub issue. Mention the bot, let it match the project and look for duplicates, review the full draft, then confirm. Self-hosted; Python 3.12, SQLite, no Python dependencies. Model inference uses the official Codex CLI with your own eligible ChatGPT subscription.
+Turn a Telegram reply into a well-scoped GitHub issue. Mention the bot, let it match the project and look for duplicates, review the full draft, then confirm. Self-hosted; Go 1.24+, one static binary, no third-party Go dependencies. Model inference uses the official Codex CLI with your own eligible ChatGPT subscription.
 
 ```text
 (reply to the bug report)
@@ -16,10 +16,10 @@ Turn a Telegram reply into a well-scoped GitHub issue. Mention the bot, let it m
 - Two-stage structured model output: routing, then draft and semantic duplicate assessment.
 - GitHub lexical search plus 100 recently updated issues, including closed issues. Search is a **candidate search, not an exhaustive guarantee**; older semantically similar issues may be missed.
 - Full preview with destination and public/private warning. Only the original requester, in the same chat, can confirm or cancel. All writes require this confirmation.
-- SQLite state, a single-instance lock, source-level deduplication, expiring confirmations, and a durable pre-write state. A timed-out create is never blindly retried.
+- Durable JSON state, a single-instance lock, source-level deduplication, expiring confirmations, and a durable pre-write state. A timed-out create is never blindly retried.
 - GitHub App installation auth (preferred) or fine-grained PAT.
 - Separate model worker with no GitHub/Telegram credentials, read-only container filesystem, ephemeral Codex runs, user config ignored, shell/apps/subagents disabled, and bounded input/output/time.
-- Russian interaction messages; issue language follows the request. Prompts are in `issue_pilot/prompts.py`.
+- Russian interaction messages; issue language follows the request. Prompts are in `internal/taskbot/prompts.go`.
 
 ## Setup
 
@@ -49,7 +49,7 @@ chmod 750 secrets
 # After saving your GitHub App key (skip with PAT auth):
 # sudo chgrp 10001 secrets/github-app.pem
 # chmod 640 secrets/github-app.pem
-python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+openssl rand -hex 32
 ```
 
 Put the generated value in `WORKER_TOKEN`, fill the Telegram and GitHub settings, and replace the example numeric IDs and repositories in `config.json`. Use immutable Telegram user IDs, not usernames. `default_repository` is optional. Multiple repositories per chat are supported. Adding a repository is an administrator action; model output cannot expand access.
@@ -74,11 +74,11 @@ Official documentation: [headless authentication](https://learn.chatgpt.com/docs
 
 ## Runtime and recovery
 
-Only run one bot instance per SQLite volume and Telegram token. Polling avoids inbound ports/certificates. Do not publish the worker's port or expose its token. Long inference requests run serially to limit subscription use. Telegram's pending-update retention is finite; this is a small-team service, not a high-throughput queue.
+Only run one bot instance per state volume and Telegram token. Polling avoids inbound ports/certificates. Do not publish the worker's port or expose its token. Long inference requests run serially to limit subscription use. Telegram's pending-update retention is finite; this is a small-team service, not a high-throughput queue.
 
 A draft lasts 24 hours. Repeat the original request if Telegram delivery fails: the same source returns its durable draft/result. After cancellation or expiry, repeat the original command to generate a fresh draft. A changed instruction by the original requester replaces an unsubmitted preview and invalidates its old buttons. Created or uncertain records are never replaced automatically.
 
-If GitHub creation times out, the record becomes `uncertain` (or `creating` after a process crash). **Do not delete the record and immediately retry.** An administrator should inspect GitHub for the hidden `issue-pilot-source:<hash>` marker recorded in SQLite, including recently created issues. If found, record its URL and mark `created`; only reset to `preview` after confirming no issue was created. The app deliberately does not automate this uncertain financial-free but externally visible write.
+If GitHub creation times out, the record becomes `uncertain` (or `creating` after a process crash). **Do not delete the record and immediately retry.** An administrator should inspect GitHub for the hidden `issue-pilot-source:<hash>` marker recorded in the JSON state file, including recently created issues. If found, record its URL and mark `created`; only reset to `preview` after confirming no issue was created. The app deliberately does not automate this uncertain financial-free but externally visible write.
 
 Keep the state volume: losing it weakens duplicate protection. Back it up securely; drafts can contain private project information. Completed, cancelled and expired draft bodies are not automatically purged in this initial version; define your retention policy before deployment. Logs contain operation outcomes and update IDs, not raw messages/tokens.
 
@@ -94,10 +94,17 @@ Keep the state volume: losing it weakens duplicate protection. Back it up secure
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q issue_pilot tests
+go test -race ./...
+go vet ./...
+go build ./cmd/taskbot
 ```
 
-No API keys or accounts are needed for tests. HTTP clients are isolated at the boundary; application tests exercise real parsing, SQLite transitions and orchestration. CI also builds both container images.
+No API keys or accounts are needed for tests. Linux is the deployment target (the instance lock uses flock). HTTP clients are isolated at the boundary; application tests exercise real parsing, durable state transitions and orchestration. CI also builds both container images.
 
 See [architecture](docs/architecture.md) and [review](docs/review.md).
+
+## Migration from the initial Python implementation
+
+All application code is now Go; Python and OpenSSL signing subprocesses are removed. The Go standard library signs GitHub App JWTs. State is stored in `/data/state.json` using a 0600 temporary file, fsync, atomic rename and directory fsync. The creating barrier is persisted before any GitHub POST. The bot exits on a state-write failure rather than risking duplicate delivery.
+
+The earlier SQLite file is **not automatically imported**. If the Python version was already deployed, stop it, back up its database and reconcile all pending/uncertain operations before starting this version. Do not run both implementations against the same Telegram bot. Starting with empty state loses the local deduplication history; GitHub candidate search alone is not an equivalent replacement. Keep the old database until migration/reconciliation is complete. The Codex auth volume and existing local config remain compatible.

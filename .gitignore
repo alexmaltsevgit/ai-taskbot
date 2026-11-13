@@ -6,6 +6,6 @@ data/
 auth.json
 *.pem
 *.sqlite*
-__pycache__/
-*.py[cod]
-.venv/
+*.test
+coverage.out
+/taskbot

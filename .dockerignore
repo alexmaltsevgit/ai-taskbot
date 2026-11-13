@@ -1,4 +1,7 @@
 *
-!issue_pilot/
-!issue_pilot/**
+!go.mod
+!cmd/
+!cmd/**
+!internal/
+!internal/**
 !Dockerfile
