@@ -56,3 +56,10 @@ func TestExplicitRepositoryPreservesTrailingPunctuationInNames(t *testing.T) {
 		}
 	}
 }
+
+func TestForwardedCommandIsNotDirectAuthorization(t *testing.T) {
+	m := Message{ID: 1, From: &User{ID: 1}, Text: "/issue@bot create", Entities: []Entity{{Type: "bot_command", Length: 10}}, ForwardOrigin: map[string]any{"type": "user"}}
+	if ExtractRequest(m, "bot") != nil {
+		t.Fatal("forwarded command accepted")
+	}
+}

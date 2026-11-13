@@ -12,7 +12,7 @@ import (
 )
 
 func ExtractRequest(m Message, bot string) *Request {
-	if m.From == nil || m.From.ID <= 0 || m.From.IsBot || m.SenderChat != nil {
+	if m.From == nil || m.From.ID <= 0 || m.From.IsBot || m.SenderChat != nil || m.ForwardOrigin != nil {
 		return nil
 	}
 	text, entities := m.Text, m.Entities
@@ -55,7 +55,6 @@ func ExtractRequest(m Message, bot string) *Request {
 }
 
 var repoPattern = regexp.MustCompile(`[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`)
-var validRepo = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 
 func ExplicitRepository(instruction string, allowed []string) (string, error) {
 	matches := repoPattern.FindAllString(instruction, -1)
@@ -128,7 +127,7 @@ func ValidateConfig(config Config) error {
 		return fmt.Errorf("configure at least one chat")
 	}
 	for id, policy := range config {
-		if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+		if _, err := strconv.ParseInt(id, 10, 64); err != nil && id != "*" {
 			return fmt.Errorf("invalid chat ID")
 		}
 		if len(policy.Users) == 0 || len(policy.Repositories) == 0 {
@@ -139,14 +138,35 @@ func ValidateConfig(config Config) error {
 				return fmt.Errorf("invalid user ID")
 			}
 		}
+		if id == "*" && policy.HistoryEnabled {
+			return fmt.Errorf("wildcard chat history requires explicit per-topic opt-in")
+		}
+		if slices.Contains(policy.Repositories, "*") && len(policy.Repositories) != 1 {
+			return fmt.Errorf("repository wildcard must be the only entry")
+		}
 		for _, repo := range policy.Repositories {
-			if !validRepo.MatchString(repo) {
+			if repo != "*" && !validRepositoryName(repo) {
 				return fmt.Errorf("invalid repository")
 			}
 		}
-		if policy.DefaultRepository != "" && !slices.Contains(policy.Repositories, policy.DefaultRepository) {
+		if policy.DefaultRepository != "" && (!validRepositoryName(policy.DefaultRepository) || (!slices.Contains(policy.Repositories, "*") && !containsRepository(policy.Repositories, policy.DefaultRepository))) {
 			return fmt.Errorf("default repository must be allowed")
 		}
 	}
 	return nil
+}
+
+// GitHub repository names are case-insensitive; preserve the API's canonical
+// spelling when selecting from an authorized catalog.
+func canonicalRepository(names []string, name string) (string, bool) {
+	for _, candidate := range names {
+		if strings.EqualFold(candidate, name) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+func containsRepository(names []string, name string) bool {
+	_, ok := canonicalRepository(names, name)
+	return ok
 }
