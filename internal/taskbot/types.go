@@ -14,6 +14,8 @@ type Entity struct {
 	Length int    `json:"length"`
 }
 type Message struct {
+	Date            int64    `json:"date"`
+	ThreadID        int64    `json:"message_thread_id"`
 	ID              int64    `json:"message_id"`
 	From            *User    `json:"from"`
 	Chat            Chat     `json:"chat"`
@@ -30,8 +32,10 @@ type Message struct {
 	Audio           any      `json:"audio"`
 }
 type Request struct {
+	Edit                                bool
 	ChatID, UserID, MessageID, SourceID int64
 	ChatTitle, Instruction, Source      string
+	ThreadID                            int64
 	HasAttachment                       bool
 }
 type Repository struct {
@@ -55,15 +59,18 @@ type Proposal struct {
 	Question        string  `json:"question"`
 }
 type Payload struct {
-	Instruction         string       `json:"instruction"`
-	QuotedMessage       string       `json:"quoted_message"`
-	ChatTitle           string       `json:"chat_title"`
-	Repositories        []Repository `json:"repositories"`
-	PreferredRepository string       `json:"preferred_repository"`
-	HasUnreadAttachment bool         `json:"has_unread_attachment"`
-	Issues              []Issue      `json:"issues"`
+	EditTarget          *Issue           `json:"edit_target,omitempty"`
+	Discussion          []ContextMessage `json:"discussion"`
+	Instruction         string           `json:"instruction"`
+	QuotedMessage       string           `json:"quoted_message"`
+	ChatTitle           string           `json:"chat_title"`
+	Repositories        []Repository     `json:"repositories"`
+	PreferredRepository string           `json:"preferred_repository"`
+	HasUnreadAttachment bool             `json:"has_unread_attachment"`
+	Issues              []Issue          `json:"issues"`
 }
 type Policy struct {
+	HistoryEnabled    bool     `json:"history_enabled,omitempty"`
 	Users             []int64  `json:"users"`
 	Repositories      []string `json:"repositories"`
 	DefaultRepository string   `json:"default_repository,omitempty"`
@@ -71,6 +78,7 @@ type Policy struct {
 type Config map[string]Policy
 type Result struct {
 	Kind, Token, URL, Text string
+	EditNumber             int
 	Proposal               Proposal
 	Private                bool
 }

@@ -12,7 +12,7 @@ import (
 )
 
 func ExtractRequest(m Message, bot string) *Request {
-	if m.From == nil || m.From.ID <= 0 || m.From.IsBot || m.SenderChat != nil || m.Reply == nil {
+	if m.From == nil || m.From.ID <= 0 || m.From.IsBot || m.SenderChat != nil {
 		return nil
 	}
 	text, entities := m.Text, m.Entities
@@ -21,6 +21,7 @@ func ExtractRequest(m Message, bot string) *Request {
 	}
 	units := utf16.Encode([]rune(text))
 	addressed := false
+	edit := false
 	for _, entity := range entities {
 		if entity.Offset < 0 || entity.Length < 0 || entity.Offset > len(units) || entity.Length > len(units)-entity.Offset {
 			continue
@@ -32,17 +33,25 @@ func ExtractRequest(m Message, bot string) *Request {
 		if entity.Type == "bot_command" && (token == "/issue" || token == "/issue@"+strings.ToLower(bot)) {
 			addressed = true
 		}
+		if entity.Offset == 0 && entity.Type == "bot_command" && (token == "/edit" || token == "/edit@"+strings.ToLower(bot)) {
+			addressed = true
+			edit = true
+		}
 	}
 	if !addressed {
 		return nil
 	}
-	source := m.Reply.Text
-	if source == "" {
-		source = m.Reply.Caption
+	quoted := &m
+	if m.Reply != nil {
+		quoted = m.Reply
 	}
-	return &Request{ChatID: m.Chat.ID, UserID: m.From.ID, MessageID: m.ID, SourceID: m.Reply.ID,
+	source := quoted.Text
+	if source == "" {
+		source = quoted.Caption
+	}
+	return &Request{Edit: edit, ChatID: m.Chat.ID, UserID: m.From.ID, MessageID: m.ID, SourceID: quoted.ID, ThreadID: m.ThreadID,
 		ChatTitle: m.Chat.Title, Instruction: truncate(text, 8000), Source: truncate(source, 16000),
-		HasAttachment: m.Reply.Photo != nil || m.Reply.Document != nil || m.Reply.Video != nil || m.Reply.Voice != nil || m.Reply.Audio != nil}
+		HasAttachment: quoted.Photo != nil || quoted.Document != nil || quoted.Video != nil || quoted.Voice != nil || quoted.Audio != nil}
 }
 
 var repoPattern = regexp.MustCompile(`[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`)

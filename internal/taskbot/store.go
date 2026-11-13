@@ -12,6 +12,7 @@ import (
 )
 
 type Draft struct {
+	EditTarget  *Issue    `json:"edit_target,omitempty"`
 	Token       string    `json:"token"`
 	Source      string    `json:"source"`
 	Fingerprint string    `json:"fingerprint"`

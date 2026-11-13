@@ -19,9 +19,10 @@ type Callback struct {
 	Message Message `json:"message"`
 }
 type Update struct {
-	ID       int64     `json:"update_id"`
-	Message  *Message  `json:"message"`
-	Callback *Callback `json:"callback_query"`
+	ID            int64     `json:"update_id"`
+	Message       *Message  `json:"message"`
+	EditedMessage *Message  `json:"edited_message"`
+	Callback      *Callback `json:"callback_query"`
 }
 type Telegram interface {
 	Call(context.Context, string, any, any) error
@@ -38,10 +39,16 @@ func RenderResult(result Result) []Outgoing {
 		}
 		text = fmt.Sprintf("Репозиторий: %s (%s)\n\n%s\n\n%s", result.Proposal.Repository, visibility, result.Proposal.Title, result.Proposal.Body)
 		buttons = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "Создать issue", "callback_data": "create:" + result.Token}, {"text": "Отмена", "callback_data": "cancel:" + result.Token}}}}
+		if result.EditNumber > 0 {
+			text = fmt.Sprintf("Редактирование issue #%d: %s\nПолный новый текст:\n%s", result.EditNumber, result.URL, text)
+			buttons = map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "Сохранить изменения", "callback_data": "create:" + result.Token}, {"text": "Отмена", "callback_data": "cancel:" + result.Token}}}}
+		}
 	case "created":
-		text = "Создано: " + result.URL
+		text = outcomeText("Новая", result)
 	case "duplicate":
-		text = "Нашёл существующую задачу: " + result.URL
+		text = outcomeText("Дубль", result)
+	case "edited":
+		text = outcomeText("Отредактировано", result)
 	case "question":
 		text = result.Text
 	case "denied":
@@ -51,7 +58,10 @@ func RenderResult(result Result) []Outgoing {
 	case "expired":
 		text = "Черновик устарел. Повторите команду ответом на исходное сообщение."
 	case "uncertain":
-		text = "Результат создания не подтверждён. Я не повторяю запрос, чтобы не создать дубль. Проверьте issues и попросите администратора сверить запись."
+		text = "Результат операции не подтверждён. Я не повторяю запрос, чтобы не создать дубль. Проверьте issues и попросите администратора сверить запись."
+		if result.URL != "" {
+			text += "\n" + result.URL
+		}
 	default:
 		text = "Операция не завершена."
 	}
@@ -80,9 +90,12 @@ func RenderResult(result Result) []Outgoing {
 	messages[len(messages)-1].Buttons = buttons
 	return messages
 }
-func SendResult(ctx context.Context, telegram Telegram, chatID, messageID int64, result Result) error {
+func SendResult(ctx context.Context, telegram Telegram, chatID, messageID int64, result Result, threadIDs ...int64) error {
 	for _, message := range RenderResult(result) {
 		args := map[string]any{"chat_id": chatID, "text": message.Text, "link_preview_options": map[string]bool{"is_disabled": true}, "reply_parameters": map[string]any{"message_id": messageID, "allow_sending_without_reply": true}}
+		if len(threadIDs) > 0 && threadIDs[0] != 0 {
+			args["message_thread_id"] = threadIDs[0]
+		}
 		if message.Buttons != nil {
 			args["reply_markup"] = message.Buttons
 		}
@@ -114,11 +127,16 @@ func HandleUpdate(ctx context.Context, update Update, service *Service, telegram
 		if err != nil && result.Kind == "" {
 			result = Result{Kind: "question", Text: "Операция не завершена. Проверьте GitHub и повторите нажатие позже; неподтверждённое создание автоматически не повторяется."}
 		}
-		return SendResult(ctx, telegram, chatID, callback.Message.ID, result)
+		return SendResult(ctx, telegram, chatID, callback.Message.ID, result, callback.Message.ThreadID)
+	}
+	if update.EditedMessage != nil {
+		service.Remember(*update.EditedMessage)
+		return nil
 	}
 	if update.Message == nil {
 		return nil
 	}
+	service.Remember(*update.Message)
 	request := ExtractRequest(*update.Message, username)
 	if request == nil {
 		return nil
@@ -126,7 +144,11 @@ func HandleUpdate(ctx context.Context, update Update, service *Service, telegram
 	if _, allowed := service.Allowed(request.UserID, request.ChatID); !allowed {
 		return nil
 	}
-	if err := telegram.Call(ctx, "sendMessage", map[string]any{"chat_id": request.ChatID, "text": "Проверю проект и похожие задачи.", "reply_parameters": map[string]int64{"message_id": request.MessageID}}, nil); err != nil {
+	acknowledgment := map[string]any{"chat_id": request.ChatID, "text": "Проверю проект и похожие задачи.", "reply_parameters": map[string]int64{"message_id": request.MessageID}}
+	if request.ThreadID != 0 {
+		acknowledgment["message_thread_id"] = request.ThreadID
+	}
+	if err := telegram.Call(ctx, "sendMessage", acknowledgment, nil); err != nil {
 		return err
 	}
 	result, err := service.Prepare(ctx, *request)
@@ -134,9 +156,12 @@ func HandleUpdate(ctx context.Context, update Update, service *Service, telegram
 		log.Print("Preparation failed; no issue creation attempted")
 		result = Result{Kind: "question", Text: "Не удалось подготовить задачу. Проверьте доступ к GitHub и модели, укажите разрешённый owner/repo и повторите команду."}
 	}
-	return SendResult(ctx, telegram, request.ChatID, request.MessageID, result)
+	return SendResult(ctx, telegram, request.ChatID, request.MessageID, result, request.ThreadID)
 }
 func RunBot(ctx context.Context, service *Service, telegram Telegram) error {
+	cleanupContext, cancelCleanup := context.WithCancel(ctx)
+	defer cancelCleanup()
+	go service.expireHistory(cleanupContext)
 	var identity struct {
 		Username string `json:"username"`
 	}
@@ -148,7 +173,7 @@ func RunBot(ctx context.Context, service *Service, telegram Telegram) error {
 	}
 	for ctx.Err() == nil {
 		var updates []Update
-		err := telegram.Call(ctx, "getUpdates", map[string]any{"offset": service.Store.Offset(), "timeout": 30, "allowed_updates": []string{"message", "callback_query"}}, &updates)
+		err := telegram.Call(ctx, "getUpdates", map[string]any{"offset": service.Store.Offset(), "timeout": 30, "allowed_updates": []string{"message", "edited_message", "callback_query"}}, &updates)
 		if err != nil {
 			log.Print("Polling unavailable; retrying")
 			select {
@@ -169,4 +194,19 @@ func RunBot(ctx context.Context, service *Service, telegram Telegram) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// Summaries are derived from the actual duplicate or confirmed draft, not another
+// inference call which might invent a different outcome.
+func outcomeText(label string, result Result) string {
+	summary := strings.Join(strings.Fields(RedactSecrets(result.Proposal.Title)), " ")
+	body := result.Proposal.Body
+	if index := strings.Index(body, "<!--"); index >= 0 {
+		body = body[:index]
+	}
+	body = strings.Join(strings.Fields(RedactSecrets(body)), " ")
+	if body != "" {
+		summary += "\n" + truncate(body, 220)
+	}
+	return label + ": " + result.URL + "\n" + summary
 }

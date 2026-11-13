@@ -45,3 +45,46 @@ func TestStaleCallbackStillCreates(t *testing.T) {
 		t.Fatal("confirmation dropped")
 	}
 }
+
+func TestOutcomeLabelsLinkAndSummary(t *testing.T) {
+	for kind, label := range map[string]string{"created": "Новая", "duplicate": "Дубль", "edited": "Отредактировано"} {
+		result := Result{Kind: kind, URL: "https://github.com/acme/paint/issues/1", Proposal: Proposal{Title: "Исправить оплату", Body: "Ошибка при сохранении"}}
+		text := RenderResult(result)[0].Text
+		for _, expected := range []string{label, result.URL, result.Proposal.Title, result.Proposal.Body} {
+			if !strings.Contains(text, expected) {
+				t.Fatal(text)
+			}
+		}
+	}
+}
+
+type payloadTelegram struct{ messages []map[string]any }
+
+func (f *payloadTelegram) Call(_ context.Context, method string, input, output any) error {
+	if method == "sendMessage" {
+		f.messages = append(f.messages, input.(map[string]any))
+	}
+	return nil
+}
+func TestStandaloneAcknowledgmentTopicRouting(t *testing.T) {
+	for _, topic := range []int64{0, 42} {
+		s, _, _ := fixture(t)
+		telegram := &payloadTelegram{}
+		m := Message{ID: 8, ThreadID: topic, From: &User{ID: 7}, Chat: Chat{ID: -1001}, Text: "/issue@bot fix save", Entities: []Entity{{Type: "bot_command", Length: 10}}}
+		if err := HandleUpdate(context.Background(), Update{Message: &m}, s, telegram, "bot"); err != nil {
+			t.Fatal(err)
+		}
+		if len(telegram.messages) < 2 {
+			t.Fatal("missing acknowledgment/preview")
+		}
+		for _, message := range telegram.messages {
+			got, present := message["message_thread_id"]
+			if topic == 0 && present {
+				t.Fatal("zero topic sent")
+			}
+			if topic != 0 && (!present || got != topic) {
+				t.Fatal("wrong topic", message)
+			}
+		}
+	}
+}

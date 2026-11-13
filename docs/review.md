@@ -1,24 +1,32 @@
-# Go rewrite verification and independent review
+# Проверки и независимое ревью
 
-The application was rewritten from Python to Go on 2026-11-13. All runtime application code is now Go, using only the standard library.
+## Перенос на Go
 
-## Independent findings and fixes
+Первоначальное независимое ревью выявило два замечания: усечение разрешённых имён репозиториев с завершающими символами и выживание дочернего процесса Codex после таймаута. Оба исправлены и покрыты регрессионными тестами. Повторное независимое ревью финального Go-коммита прошло без блокирующих замечаний.
 
-An independent reviewer ran `go test -race -count=1 ./...` and `go vet ./...` and identified two P2 issues:
+## Контекст обсуждения и редактирование
 
-1. Repository matching truncated valid names ending with `-` or `.`. The parser now preserves the full token; a regression test covers two similarly named allowed repositories.
-2. Cancelling the npm Codex launcher could leave its native child alive. Codex now runs in a separate Linux process group; cancellation kills the whole group. A real launcher/child regression test verifies no delayed child action survives timeout.
+Добавлены ограниченная история в памяти с изоляцией чатов/тем, команды без реплая, явное редактирование через /edit, метки результата со ссылкой и резюме, полностью русская инструкция установки.
 
-Both regression tests were observed failing before the fixes and passing afterward. No P1 was identified in the reviewed scope. Independent re-review of the fixes is pending.
+Независимый reviewer проверил код и повторно запустил race-тесты и vet. Исправлены:
+1. Приложение теперь детерминированно сохраняет исходные маркеры защиты от дублей при редактировании, удаляет маркеры, сгенерированные моделью, и проверяет размер окончательного описания.
+2. /edit разрешает редактирование только как ведущая команда. Упоминание этой команды внутри запроса на создание не меняет тип операции.
+3. Нулевой message_thread_id не передаётся в Telegram; сообщения обычных чатов и тем покрыты проверкой исходящих параметров.
 
-## Verification
+Повторное независимое ревью исправлений: блокирующих замечаний нет.
 
-- `go test -race -count=1 ./...`: passed.
-- `go vet ./...`: passed.
-- `CGO_ENABLED=0 go build ./cmd/taskbot`: passed.
-- `gofmt` applied to all Go source.
-- Tests cover routing, access controls, preview/confirmation, duplicate and uncertain-write handling, durable state and locking, GitHub HTTP parsing/search, RS256 JWTs, worker authorization/bounds, and process cancellation.
-- Container builds and CI results are tracked on the pull request.
-- Real Codex login/inference and Telegram-to-GitHub end-to-end testing require server credentials and were not performed.
+## Автоматические проверки
 
-The README describes the state-format change and safe handling of any earlier SQLite deployment. No server deployment was performed.
+- 37 тестовых функций, включая таблицы сценариев.
+- `go test -race -count=1 ./...`: успешно.
+- `go vet ./...`: успешно.
+- `CGO_ENABLED=0 go build ./cmd/taskbot`: успешно.
+- Все Go-файлы отформатированы gofmt.
+- Покрыты доступ, подтверждения, дубли, неопределённые записи, сохранение состояния, парсинг API, подпись JWT, изоляция worker, отмена группы процессов, границы/TTL/изменения истории, отсутствие реплая, контекст в запросе модели, явность редактирования, конфликт внешней записи, сохранение маркера, отсутствие повторного PATCH, ссылки/резюме и маршрутизация тем.
+- CI дополнительно собирает оба Docker-образа; фактический результат привязан к коммиту PR.
+
+## Не проверено автоматически
+
+Реальные Telegram/GitHub-записи, вход и inference через подписку Codex требуют учётных данных сервера. Их не выполняли; сервер не развёртывался. Последовательность живой проверки описана в README.
+
+Оставшееся ограничение: внешнее редактирование issue между проверкой исходника и PATCH не может быть атомарно исключено в текущем GitHub-потоке. Описание конкурентных изменений и восстановления неопределённых операций есть в README.
