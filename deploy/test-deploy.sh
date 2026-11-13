@@ -3,6 +3,7 @@
 # and shell syntax; actual Docker/SSH behavior requires the documented live test.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+bash deploy/test-rootless.sh
 bash -n deploy/install-release.sh deploy/validate-inputs.sh deploy/validate-ssh.sh deploy/diagnose-server.sh
 export DEPLOY_ENABLED=true DEPLOY_HOST=server.example DEPLOY_USER=taskbot
 export DEPLOY_PORT=22222 DEPLOY_ROOT=/home/taskbot/ai-taskbot DEPLOY_PLATFORM=linux/amd64
