@@ -45,8 +45,8 @@ func run() error {
 		}
 		return err
 	}
-	if mode != "bot" {
-		return fmt.Errorf("usage: taskbot [bot|worker]")
+	if mode != "bot" && mode != "check-config" {
+		return fmt.Errorf("usage: taskbot [bot|worker|check-config]")
 	}
 	raw, err := os.ReadFile(env("CONFIG_FILE", "config.json"))
 	if err != nil {
@@ -58,6 +58,10 @@ func run() error {
 	}
 	if err = taskbot.ValidateConfig(config); err != nil {
 		return err
+	}
+	// Deployment preflight validates configuration without polling or changing state.
+	if mode == "check-config" {
+		return nil
 	}
 	statePath := env("STATE_FILE", "data/state.json")
 	lock, err := taskbot.LockState(statePath)

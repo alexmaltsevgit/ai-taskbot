@@ -1,0 +1,94 @@
+name: Deploy AI Taskbot
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'prepare: загрузить образы; deploy: запустить после настройки'
+        type: choice
+        options: [prepare, deploy]
+        default: prepare
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: ai-taskbot-production-deploy
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.13'
+          cache: false
+      - name: Verify source and deployment scripts
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go test -race ./...
+          go vet ./...
+          bash deploy/test-deploy.sh
+      - name: Build the verified server architecture
+        env:
+          DEPLOY_PLATFORM: ${{ vars.DEPLOY_PLATFORM }}
+        run: |
+          test "$DEPLOY_PLATFORM" = linux/amd64
+          docker build --platform linux/amd64 --target bot -t "ai-taskbot-bot:$GITHUB_SHA" .
+          docker build --platform linux/amd64 --target worker -t "ai-taskbot-worker:$GITHUB_SHA" .
+          mkdir bundle
+          docker save "ai-taskbot-bot:$GITHUB_SHA" "ai-taskbot-worker:$GITHUB_SHA" | gzip > bundle/images.tar.gz
+          cp deploy/compose.yaml deploy/install-release.sh bundle/
+          (cd bundle && sha256sum images.tar.gz compose.yaml install-release.sh > checksums.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ github.sha }}
+          path: bundle/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      DEPLOY_ENABLED: ${{ vars.DEPLOY_ENABLED }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+      DEPLOY_ROOT: ${{ vars.DEPLOY_ROOT }}
+      DEPLOY_PLATFORM: ${{ vars.DEPLOY_PLATFORM }}
+      RELEASE_SHA: ${{ github.sha }}
+      DEPLOY_MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require explicit deployment configuration
+        run: bash deploy/validate-inputs.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: deployment-${{ github.sha }}
+          path: bundle
+      - name: Transfer and install without exposing runtime credentials
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          unset DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS
+          options=(-i "$ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$ssh_dir/known_hosts" -o ConnectTimeout=15)
+          target="$DEPLOY_USER@$DEPLOY_HOST"
+          destination="$DEPLOY_ROOT/releases/$RELEASE_SHA"
+          ssh "${options[@]}" -p "$DEPLOY_PORT" "$target" "umask 077; mkdir -p '$destination'"
+          scp "${options[@]}" -P "$DEPLOY_PORT" bundle/images.tar.gz bundle/compose.yaml bundle/install-release.sh bundle/checksums.txt "$target:$destination/"
+          ssh "${options[@]}" -p "$DEPLOY_PORT" "$target" "bash '$destination/install-release.sh' '$DEPLOY_ROOT' '$RELEASE_SHA' '$DEPLOY_MODE'"
