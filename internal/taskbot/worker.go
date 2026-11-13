@@ -40,12 +40,7 @@ func InferWithCodex(ctx context.Context, payload Payload) (Proposal, error) {
 	ctx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 	command := isolatedCommand(ctx, "codex", CodexArguments(directory, schema, output, os.Getenv("CODEX_MODEL"))...)
-	command.Env = []string{}
-	for _, key := range []string{"PATH", "HOME", "CODEX_HOME", "LANG", "SSL_CERT_FILE"} {
-		if value, ok := os.LookupEnv(key); ok {
-			command.Env = append(command.Env, key+"="+value)
-		}
-	}
+	command.Env = CodexEnvironment()
 	command.Stdin = strings.NewReader(SystemPrompt + "\nUNTRUSTED INPUT JSON:\n" + string(encoded))
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard

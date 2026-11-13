@@ -52,7 +52,10 @@ func GitHubTokenProvider() (func(context.Context) (string, error), error) {
 	var mu sync.Mutex
 	var token string
 	var until time.Time
-	client := NewHTTPClient(45 * time.Second)
+	client, err := NewExternalHTTPClient(45 * time.Second)
+	if err != nil {
+		return nil, err
+	}
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()

@@ -51,6 +51,7 @@ case "$1" in
  inspect) if [[ ${TEST_UNHEALTHY:-} == yes ]];then echo 'false 1';else echo 'true 0';fi ;;
  run) printf 'mock-backup' ;;
  compose)
+  if [[ ${TEST_NETWORK_FAIL:-} == yes && $* == *' worker node -e '* ]]; then exit 21; fi
   if [[ $* == *' ps -q '* ]]; then
     if [[ ${TEST_PS_FAIL:-} == yes ]]; then exit 17; fi
     echo container
@@ -83,10 +84,11 @@ export PATH="$sandbox/bin:$PATH"
 export DEPLOY_ROOT="$sandbox/app"
 printf 'not-real-secrets\n' > "$DEPLOY_ROOT/shared/.env"
 printf '{}\n' > "$DEPLOY_ROOT/shared/config.json"
+printf '{}\n' > "$DEPLOY_ROOT/shared/secrets/proxy.json"
 release="$DEPLOY_ROOT/releases/$RELEASE_SHA"
-cp deploy/compose.yaml deploy/install-release.sh "$release/"
+cp deploy/compose.yaml deploy/install-release.sh deploy/codex-login.sh deploy/probes/egress.js "$release/"
 printf 'mock-images' | gzip > "$release/images.tar.gz"
-(cd "$release" && sha256sum images.tar.gz compose.yaml install-release.sh > checksums.txt)
+(cd "$release" && sha256sum images.tar.gz compose.yaml install-release.sh codex-login.sh egress.js > checksums.txt)
 bash deploy/install-release.sh "$DEPLOY_ROOT" "$RELEASE_SHA" prepare
 test ! -f "$DEPLOY_ROOT/current"
 test "$(stat -c %a "$DEPLOY_ROOT/shared/data")" = 700
@@ -94,6 +96,8 @@ test "$(stat -c %a "$DEPLOY_ROOT/shared/codex-auth")" = 700
 if TEST_ROOTFUL=yes bash deploy/install-release.sh "$DEPLOY_ROOT" "$RELEASE_SHA" prepare >/dev/null 2>&1; then echo 'Rootful engine accepted'; exit 1; fi
 bash deploy/install-release.sh "$DEPLOY_ROOT" "$RELEASE_SHA" deploy
 test "$(cat "$DEPLOY_ROOT/current")" = "$RELEASE_SHA"
+grep -q "ps -q egress" "$DEPLOY_TEST_TRACE"
+if grep -E " run .*--no-build" "$DEPLOY_TEST_TRACE"; then echo "Unsupported run flag"; exit 1; fi
 previous=$RELEASE_SHA
 export RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 mkdir "$DEPLOY_ROOT/releases/$RELEASE_SHA"
@@ -103,7 +107,7 @@ test "$(cat "$DEPLOY_ROOT/current")" = "$previous"
 grep -q "releases/$previous/compose.yaml up -d --no-build --pull never" "$DEPLOY_TEST_TRACE"
 # Failures from ordinary shell commands must trigger exactly one rollback,
 # preserve the error code, and leave the committed release marker unchanged.
-for scenario in TEST_PS_FAIL:17 TEST_BACKUP_DIR_FAIL:19 TEST_METADATA_FAIL:20 TEST_SIGNAL:143; do
+for scenario in TEST_PS_FAIL:17 TEST_BACKUP_DIR_FAIL:19 TEST_METADATA_FAIL:20 TEST_SIGNAL:143 TEST_NETWORK_FAIL:21; do
   variable=${scenario%:*}
   expected=${scenario#*:}
   : > "$DEPLOY_TEST_TRACE"
@@ -121,6 +125,19 @@ test "$status" = 17
 grep -q 'rollback failed' "$sandbox/failure.log"
 if grep -Eq 'prune|down|volume rm|system ' "$DEPLOY_TEST_TRACE"; then echo 'Unsafe cleanup command'; exit 1; fi
 echo 'Mock staging, deployment, rootless boundary and rollback tests passed'
+
+# Never restore a legacy release that would reconnect applications directly.
+legacy="$DEPLOY_ROOT/releases/$previous/compose.yaml"
+cp "$legacy" "$sandbox/strict-compose"
+sed -i '/^x-ai-taskbot-egress: required-v1$/d' "$legacy"
+: > "$DEPLOY_TEST_TRACE"
+status=0
+TEST_NETWORK_FAIL=yes bash deploy/install-release.sh "$DEPLOY_ROOT" "$RELEASE_SHA" deploy >"$sandbox/failure.log" 2>&1 || status=$?
+test "$status" = 21
+if grep -q "releases/$previous/compose.yaml up " "$DEPLOY_TEST_TRACE"; then echo 'Unproxied rollback attempted'; exit 1; fi
+grep -q "releases/$RELEASE_SHA/compose.yaml stop" "$DEPLOY_TEST_TRACE"
+grep -q 'no automatic rollback to an unproxied release' "$sandbox/failure.log"
+cp "$sandbox/strict-compose" "$legacy"
 
 # Diagnostic probes must never invoke setup or service-changing commands.
 for tool in dockerd-rootless-setuptool.sh dockerd-rootless.sh newuidmap newgidmap; do

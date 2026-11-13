@@ -36,3 +36,20 @@ func TestConfigPreflightDoesNotStartBotOrCreateState(t *testing.T) {
 		t.Fatal("invalid config accepted")
 	}
 }
+
+func TestProxyPreflightNeedsNoApplicationCredentials(t *testing.T) {
+	originalArgs := os.Args
+	t.Cleanup(func() { os.Args = originalArgs })
+	os.Args = []string{"taskbot", "check-proxy-config"}
+	t.Setenv("WORKER_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "")
+	file := filepath.Join(t.TempDir(), "proxy.json")
+	if err := os.WriteFile(file, []byte(`{"url":"http://192.0.2.10:8080","username":"synthetic","password":"not-real"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROXY_CONFIG_FILE", file)
+	if err := run(); err != nil {
+		t.Fatal(err)
+	}
+}
